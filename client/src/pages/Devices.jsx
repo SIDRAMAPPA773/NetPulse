@@ -17,7 +17,10 @@ import {
   X,
   Filter,
   RefreshCw,
-  Activity
+  Radar,
+  Radio,
+  Check,
+  ShieldCheck
 } from 'lucide-react';
 import { format } from 'date-fns';
 import clsx from 'clsx';
@@ -28,6 +31,8 @@ const Devices = () => {
   const [search, setSearch] = useState('');
   const [typeFilter, setTypeFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
+  
+  // Add modal state
   const [showAddModal, setShowAddModal] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [newDevice, setNewDevice] = useState({
@@ -39,6 +44,13 @@ const Devices = () => {
     monitoringMethod: 'icmp',
     snmpCommunity: 'public'
   });
+
+  // Auto-Discovery Scanner modal state
+  const [showScanModal, setShowScanModal] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [scanResults, setScanResults] = useState(null);
+  const [selectedIps, setSelectedIps] = useState(new Set());
+  const [enrollingBatch, setEnrollingBatch] = useState(false);
 
   useEffect(() => {
     fetchDevices();
@@ -102,6 +114,51 @@ const Devices = () => {
     }
   };
 
+  // Run subnet discovery
+  const handleStartScan = async () => {
+    setShowScanModal(true);
+    setScanning(true);
+    try {
+      const res = await api.get('/devices/discover');
+      setScanResults(res.data);
+      // Preselect devices that are not yet enrolled
+      const unenrolled = new Set(
+        res.data.devices.filter(d => !d.isEnrolled).map(d => d.ipAddress)
+      );
+      setSelectedIps(unenrolled);
+    } catch (err) {
+      console.error('Scan failed', err);
+      alert('Failed to run subnet scan.');
+    } finally {
+      setScanning(false);
+    }
+  };
+
+  const toggleSelectIp = (ip) => {
+    setSelectedIps(prev => {
+      const next = new Set(prev);
+      if (next.has(ip)) next.delete(ip);
+      else next.add(ip);
+      return next;
+    });
+  };
+
+  const handleEnrollSelected = async () => {
+    if (!scanResults || selectedIps.size === 0) return;
+    setEnrollingBatch(true);
+    try {
+      const toEnroll = scanResults.devices.filter(d => selectedIps.has(d.ipAddress));
+      await api.post('/devices/enroll-multiple', { devices: toEnroll });
+      await fetchDevices();
+      setShowScanModal(false);
+    } catch (err) {
+      console.error('Error enrolling batch', err);
+      alert('Failed to enroll selected devices');
+    } finally {
+      setEnrollingBatch(false);
+    }
+  };
+
   const filteredDevices = devices.filter(d => {
     const matchesSearch = 
       d.name.toLowerCase().includes(search.toLowerCase()) || 
@@ -121,7 +178,7 @@ const Devices = () => {
   return (
     <div className="space-y-6 pb-12">
       
-      {/* Top Header & Action */}
+      {/* Top Header & Actions */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h1 className="text-xl sm:text-2xl font-extrabold tracking-tight text-slate-900 flex items-center gap-2">
@@ -132,12 +189,24 @@ const Devices = () => {
           </p>
         </div>
 
-        <button 
-          onClick={() => setShowAddModal(true)}
-          className="px-4 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold flex items-center gap-2 transition-all shadow-sm cursor-pointer self-start sm:self-auto"
-        >
-          <Plus className="w-4 h-4" /> Add Network Node
-        </button>
+        <div className="flex items-center gap-2.5 self-start sm:self-auto flex-wrap">
+          {/* Subnet Auto-Discover Button */}
+          <button 
+            onClick={handleStartScan}
+            className="px-4 py-2.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-300 text-xs font-bold flex items-center gap-2 transition-all shadow-xs cursor-pointer"
+          >
+            <Radar className="w-4 h-4 text-emerald-600 animate-spin" style={{ animationDuration: '4s' }} /> 
+            Scan Local Network (Auto-Discover)
+          </button>
+
+          {/* Add Device Button */}
+          <button 
+            onClick={() => setShowAddModal(true)}
+            className="px-4 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold flex items-center gap-2 transition-all shadow-xs cursor-pointer"
+          >
+            <Plus className="w-4 h-4" /> Add Network Node
+          </button>
+        </div>
       </div>
 
       {/* Mini Fleet Stats Pill Strip */}
@@ -225,7 +294,7 @@ const Devices = () => {
           <div className="py-16 text-center text-slate-500 text-xs">
             <Server className="w-10 h-10 text-slate-400 mx-auto mb-3" />
             <p className="font-bold text-slate-700 text-sm">No matching network devices found</p>
-            <p className="mt-1">Try modifying your search or click "Add Network Node" above.</p>
+            <p className="mt-1">Try clicking "Scan Local Network (Auto-Discover)" to detect all active devices on your Wi-Fi.</p>
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -313,7 +382,7 @@ const Devices = () => {
                           <button
                             onClick={() => handleDeleteDevice(device._id, device.name)}
                             title="Delete Node"
-                            className="p-1.5 rounded-lg bg-slate-100 hover:bg-rose-50 text-slate-400 hover:text-rose-600 border border-slate-200 hover:border-rose-200 transition-colors"
+                            className="p-1.5 rounded-lg bg-slate-100 hover:bg-rose-50 text-slate-400 hover:text-rose-600 border border-slate-200 hover:border-rose-200 transition-colors cursor-pointer"
                           >
                             <Trash2 className="w-3.5 h-3.5" />
                           </button>
@@ -327,6 +396,142 @@ const Devices = () => {
           </div>
         )}
       </div>
+
+      {/* Auto-Discovery Scanner Modal */}
+      {showScanModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-xs">
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-2xl p-6 space-y-5 max-h-[85vh] flex flex-col">
+            
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3 shrink-0">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-emerald-50 border border-emerald-200 flex items-center justify-center text-emerald-600">
+                  <Radar className="w-5 h-5 animate-pulse" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-slate-900">Local Subnet Scanner (ARP & ICMP Sweep)</h3>
+                  <p className="text-xs text-slate-500">Detecting all real active private devices connected to your LAN</p>
+                </div>
+              </div>
+              <button 
+                onClick={() => setShowScanModal(false)}
+                className="text-slate-400 hover:text-slate-700 p-1 rounded-lg"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {scanning ? (
+              <div className="py-16 text-center space-y-3">
+                <div className="w-10 h-10 rounded-full border-2 border-emerald-200 border-t-emerald-600 animate-spin mx-auto" />
+                <p className="font-bold text-slate-800 text-sm">Sweeping your local network subnet...</p>
+                <p className="text-xs text-slate-400">Probing IP range & reading local ARP cache</p>
+              </div>
+            ) : scanResults ? (
+              <div className="flex-1 overflow-y-auto space-y-4 pr-1">
+                
+                <div className="flex items-center justify-between p-3 rounded-xl bg-slate-50 border border-slate-200 text-xs">
+                  <div>
+                    <span className="font-bold text-slate-700">Subnet Target:</span>{' '}
+                    <span className="font-mono text-sky-700 font-bold">{scanResults.subnet}</span>
+                  </div>
+                  <div className="text-slate-500">
+                    Discovered <span className="font-bold text-emerald-700 font-mono">{scanResults.count}</span> Active Hardware Nodes
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  {scanResults.devices.map(d => {
+                    const isSelected = selectedIps.has(d.ipAddress);
+                    return (
+                      <div 
+                        key={d.ipAddress}
+                        onClick={() => !d.isEnrolled && toggleSelectIp(d.ipAddress)}
+                        className={clsx(
+                          "p-3 rounded-xl border flex items-center justify-between transition-all",
+                          d.isEnrolled 
+                            ? "bg-slate-50 border-slate-200 opacity-60 cursor-not-allowed" 
+                            : isSelected 
+                            ? "bg-sky-50 border-sky-300 cursor-pointer shadow-2xs" 
+                            : "bg-white border-slate-200 hover:border-slate-300 cursor-pointer"
+                        )}
+                      >
+                        <div className="flex items-center gap-3">
+                          <input 
+                            type="checkbox"
+                            checked={isSelected}
+                            disabled={d.isEnrolled}
+                            onChange={() => toggleSelectIp(d.ipAddress)}
+                            className="w-4 h-4 rounded text-blue-600 border-slate-300 focus:ring-blue-500 cursor-pointer"
+                          />
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <span className="font-bold text-slate-900 text-xs">{d.name}</span>
+                              <span className="font-mono text-[11px] font-bold text-sky-700 px-1.5 py-0.2 rounded bg-sky-50 border border-sky-200">
+                                {d.ipAddress}
+                              </span>
+                            </div>
+                            <div className="text-[10px] text-slate-400 font-mono mt-0.5 flex items-center gap-2">
+                              <span>MAC: {d.macAddress}</span>
+                              <span>•</span>
+                              <span>{d.location}</span>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div>
+                          {d.isEnrolled ? (
+                            <span className="text-[10px] font-bold text-slate-500 uppercase px-2 py-0.5 rounded bg-slate-200">
+                              Already Enrolled
+                            </span>
+                          ) : (
+                            <span className="text-[10px] font-bold text-emerald-700 uppercase px-2 py-0.5 rounded bg-emerald-50 border border-emerald-200">
+                              Ready to Enroll
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+              </div>
+            ) : null}
+
+            {/* Footer Buttons */}
+            {scanResults && !scanning && (
+              <div className="pt-3 border-t border-slate-100 flex items-center justify-between shrink-0">
+                <button
+                  type="button"
+                  onClick={handleStartScan}
+                  className="px-3.5 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold transition-colors cursor-pointer"
+                >
+                  Rescan Subnet
+                </button>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowScanModal(false)}
+                    className="px-4 py-2 rounded-xl bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 text-xs font-bold cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    disabled={selectedIps.size === 0 || enrollingBatch}
+                    onClick={handleEnrollSelected}
+                    className="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-xs font-bold shadow-sm transition-all cursor-pointer flex items-center gap-1.5"
+                  >
+                    <Check className="w-4 h-4" />
+                    {enrollingBatch ? 'Enrolling...' : `Enroll Selected (${selectedIps.size}) Nodes`}
+                  </button>
+                </div>
+              </div>
+            )}
+
+          </div>
+        </div>
+      )}
 
       {/* Add Device Modal Dialog */}
       {showAddModal && (
@@ -364,7 +569,7 @@ const Devices = () => {
                   <input
                     type="text"
                     required
-                    placeholder="e.g. 192.168.1.1 or 8.8.8.8"
+                    placeholder="e.g. 192.168.26.1 or 8.8.8.8"
                     value={newDevice.ipAddress}
                     onChange={e => setNewDevice({ ...newDevice, ipAddress: e.target.value })}
                     className="w-full px-3.5 py-2 rounded-xl bg-white border border-slate-300 text-slate-900 placeholder-slate-400 font-mono focus:outline-none focus:border-blue-500"
