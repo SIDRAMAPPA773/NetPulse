@@ -9,6 +9,7 @@ const { getIO } = require('./socketService');
 const Setting = require('../models/Setting');
 
 let SIMULATION_MODE = true;
+let snmpState = {};
 
 // Default Thresholds
 let THRESHOLDS = {
@@ -40,7 +41,7 @@ const processDevice = async (device) => {
   
   let cpuUtilization = null;
   let memoryUtilization = null;
-  let incomingTraffic = 0;
+  let snmpData = null;
   let outgoingTraffic = 0;
 
   if (SIMULATION_MODE) {
@@ -80,28 +81,45 @@ const processDevice = async (device) => {
       }
       packetLoss = parsedLoss;
 
-      // Perform SNMP check if configured
+      let snmpData = null;
       if (isAlive && device.monitoringMethod === 'snmp' && device.snmpCommunity) {
         const session = snmp.createSession(device.ipAddress, device.snmpCommunity);
-        // OIDs: sysUpTime (1.3.6.1.2.1.1.3.0), ifInOctets (1.3.6.1.2.1.2.2.1.10.1), ifOutOctets (1.3.6.1.2.1.2.2.1.16.1)
         const oids = ["1.3.6.1.2.1.1.3.0", "1.3.6.1.2.1.2.2.1.10.1", "1.3.6.1.2.1.2.2.1.16.1"];
-        
-        await new Promise((resolve) => {
+        const result = await new Promise((resolve) => {
           session.get(oids, function (error, varbinds) {
-            if (!error) {
+            const out = { sysUpTime: null, inOctets: null, outOctets: null, supported: true };
+            if (error) { out.supported = false; out.error = error.message; }
+            else {
               for (let i = 0; i < varbinds.length; i++) {
-                if (snmp.isVarbindError(varbinds[i])) {
-                  // varbind error
-                } else {
-                  if (varbinds[i].oid === "1.3.6.1.2.1.2.2.1.10.1") incomingTraffic = Number(varbinds[i].value) || 0;
-                  if (varbinds[i].oid === "1.3.6.1.2.1.2.2.1.16.1") outgoingTraffic = Number(varbinds[i].value) || 0;
-                }
+                if (snmp.isVarbindError(varbinds[i])) { out.supported = false; continue; }
+                if (varbinds[i].oid === "1.3.6.1.2.1.1.3.0") out.sysUpTime = Number(varbinds[i].value) || 0;
+                if (varbinds[i].oid === "1.3.6.1.2.1.2.2.1.10.1") { out.inOctets = Number(varbinds[i].value) || 0; incomingTraffic = out.inOctets; }
+                if (varbinds[i].oid === "1.3.6.1.2.1.2.2.1.16.1") { out.outOctets = Number(varbinds[i].value) || 0; outgoingTraffic = out.outOctets; }
               }
             }
             session.close();
-            resolve();
+            resolve(out);
           });
         });
+        snmpData = result;
+        if (result.supported && result.inOctets !== null) {
+          const prev = snmpState[device._id];
+          const now = Date.now();
+          if (prev && result.inOctets >= prev.in && result.outOctets >= prev.out) {
+            const elapsed = (now - prev.ts) / 1000;
+            if (elapsed > 0) {
+              snmpData.inDelta = result.inOctets - prev.in;
+              snmpData.outDelta = result.outOctets - prev.out;
+              snmpData.elapsedSeconds = elapsed;
+              snmpData.inBps = snmpData.inDelta / elapsed;
+              snmpData.outBps = snmpData.outDelta / elapsed;
+            }
+          } else if (prev) {
+            // counter reset
+            snmpData.counterReset = true;
+          }
+          snmpState[device._id] = { in: result.inOctets, out: result.outOctets, ts: now };
+        }
       }
     } catch (err) {
       console.error(`Monitoring failed for ${device.ipAddress}:`, err.message);
@@ -111,14 +129,20 @@ const processDevice = async (device) => {
     }
   }
 
+  const measurementSource = SIMULATION_MODE ? 'simulated' : 'real';
+
   try {
     const previousStatus = device.status;
-    const currentStatus = isAlive ? ((latency && latency > THRESHOLDS.LATENCY_WARNING) ? 'WARNING' : 'UP') : 'DOWN';
+  const currentStatus = isAlive ? ((latency && latency > THRESHOLDS.LATENCY_WARNING) ? 'WARNING' : 'UP') : 'DOWN';
 
     // Update Device
     device.status = currentStatus;
     device.lastSeen = new Date();
     await device.save();
+
+    let collectionStatus = 'success';
+    let errorMessage = null;
+    if (!SIMULATION_MODE && snmpData && snmpData.supported === false) collectionStatus = 'unsupported';
 
     // Save Metric
     const metric = await Metric.create({
@@ -130,6 +154,10 @@ const processDevice = async (device) => {
       memoryUtilization,
       incomingTraffic,
       outgoingTraffic,
+      collectionStatus,
+      errorMessage,
+      measurementSource,
+      snmp: snmpData,
     });
 
     // Check for alerts
@@ -174,19 +202,33 @@ const createAlert = async (device, type, severity, message) => {
   } catch (e) {}
 };
 
+let monitoringStarted = false;
+let cycleRunning = false;
+
 const startMonitoring = () => {
+  if (monitoringStarted) {
+    console.log('Monitoring engine already started; skipping duplicate scheduler');
+    return;
+  }
+  monitoringStarted = true;
   console.log('Monitoring engine started');
-  
-  // Run every 10 seconds for demo purposes
+
   cron.schedule('*/10 * * * * *', async () => {
+    if (cycleRunning) return;
+    cycleRunning = true;
     try {
       await updateSettingsCache();
       const devices = await Device.find({ monitoringStatus: true });
-      devices.forEach(device => {
-        processDevice(device);
-      });
+      const { Semaphore } = require('../utils/safety');
+      const sem = new Semaphore(5);
+      await Promise.all(devices.map(async (device) => {
+        const release = await sem.acquire();
+        try { await processDevice(device); } finally { release(); }
+      }));
     } catch (err) {
       console.error('Monitoring error:', err);
+    } finally {
+      cycleRunning = false;
     }
   });
 };

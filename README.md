@@ -40,8 +40,9 @@ npm install
 cp .env.example .env
 # Seed default demo devices and admin user:
 node seed.js
-# Start server:
-npm start
+# Run tests:
+npm test
+```
 ```
 *Backend runs on `http://localhost:5000`*
 

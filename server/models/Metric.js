@@ -8,7 +8,20 @@ const metricSchema = new mongoose.Schema({
   cpuUtilization: { type: Number },
   memoryUtilization: { type: Number },
   incomingTraffic: { type: Number },
-  outgoingTraffic: { type: Number },
+  collectionStatus: { type: String, enum: ['success', 'timeout', 'unreachable', 'unsupported', 'error', 'simulated'], default: 'success' },
+  errorMessage: { type: String },
+  measurementSource: { type: String, enum: ['real', 'simulated'], default: 'real' },
+  snmp: {
+    sysUpTime: { type: Number },
+    ifIndex: { type: Number },
+    inOctets: { type: Number },
+    outOctets: { type: Number },
+    inDelta: { type: Number },
+    outDelta: { type: Number },
+    elapsedSeconds: { type: Number },
+    inBps: { type: Number },
+    outBps: { type: Number },
+  },
 }, { timestamps: true });
 
 // Add index on timestamps for fast querying of historical data
