@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import api from '../services/api';
 import { getSocket } from '../services/socket';
@@ -7,30 +7,54 @@ import {
   Plus, 
   Server, 
   Trash2, 
-  CheckCircle, 
-  AlertTriangle, 
-  XCircle, 
   ChevronRight,
   Router,
   Wifi,
   MapPin,
   X,
-  Filter,
   RefreshCw,
   Radar,
-  Radio,
   Check,
-  ShieldCheck
 } from 'lucide-react';
 import { format } from 'date-fns';
 import clsx from 'clsx';
 
+const formatRate = (bitsPerSecond) => {
+  if (bitsPerSecond === null || bitsPerSecond === undefined || !Number.isFinite(bitsPerSecond)) return 'Unavailable';
+  if (bitsPerSecond >= 1_000_000_000) return `${(bitsPerSecond / 1_000_000_000).toFixed(2)} Gbit/s`;
+  if (bitsPerSecond >= 1_000_000) return `${(bitsPerSecond / 1_000_000).toFixed(2)} Mbit/s`;
+  if (bitsPerSecond >= 1_000) return `${(bitsPerSecond / 1_000).toFixed(2)} kbit/s`;
+  return `${bitsPerSecond.toFixed(0)} bit/s`;
+};
+
+const isInSubnet = (ipAddress, subnet) => {
+  if (!subnet) return true;
+  const [network, maskText] = subnet.split('/');
+  if (maskText === undefined) return ipAddress.startsWith(subnet);
+  const maskLength = Number(maskText);
+  const toNumber = (address) => {
+    const parts = address.split('.');
+    if (parts.length !== 4 || parts.some(part => !/^\d+$/.test(part) || Number(part) > 255)) return null;
+    return parts.reduce((value, part) => (value * 256) + Number(part), 0) >>> 0;
+  };
+  const ipValue = toNumber(ipAddress);
+  const networkValue = toNumber(network);
+  if (ipValue === null || networkValue === null || !Number.isInteger(maskLength) || maskLength < 0 || maskLength > 32) return false;
+  const mask = maskLength === 0 ? 0 : (0xFFFFFFFF << (32 - maskLength)) >>> 0;
+  return (ipValue & mask) === (networkValue & mask);
+};
+
 const Devices = () => {
   const [devices, setDevices] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
   const [search, setSearch] = useState('');
   const [typeFilter, setTypeFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
+  const [subnetFilter, setSubnetFilter] = useState('');
+  const [alertSeverityFilter, setAlertSeverityFilter] = useState('');
+  const [sortBy, setSortBy] = useState('name');
+  const [page, setPage] = useState(1);
   
   // Add modal state
   const [showAddModal, setShowAddModal] = useState(false);
@@ -42,7 +66,7 @@ const Devices = () => {
     location: '',
     description: '',
     monitoringMethod: 'icmp',
-    snmpCommunity: 'public'
+    snmpCommunity: ''
   });
 
   // Auto-Discovery Scanner modal state
@@ -51,6 +75,21 @@ const Devices = () => {
   const [scanResults, setScanResults] = useState(null);
   const [selectedIps, setSelectedIps] = useState(new Set());
   const [enrollingBatch, setEnrollingBatch] = useState(false);
+  const scanController = useRef(null);
+
+  const fetchDevices = useCallback(async () => {
+    setLoading(true);
+    setLoadError('');
+    try {
+      const res = await api.get('/devices');
+      setDevices(res.data);
+    } catch (error) {
+      console.error('Failed to fetch devices', error);
+      setLoadError('Unable to load the device inventory. Check the connection and try again.');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
     fetchDevices();
@@ -58,26 +97,30 @@ const Devices = () => {
     const socket = getSocket();
     if (socket) {
       socket.on('deviceUpdated', (updatedDevice) => {
-        setDevices(prev => prev.map(d => d._id === updatedDevice._id ? updatedDevice : d));
+        setDevices(prev => prev.map(d => d._id === updatedDevice._id
+          ? { ...d, ...updatedDevice }
+          : d));
+      });
+      socket.on('metricAdded', (metric) => {
+        const deviceId = typeof metric.device === 'object' ? metric.device?._id : metric.device;
+        setDevices(prev => prev.map(device => device._id === deviceId ? {
+          ...device,
+          latestMetric: metric,
+          collectionStatus: metric.collectionStatus || 'unknown',
+          collectionReason: metric.reasonUnavailable || null,
+          recentLatency: [...(device.recentLatency || []), metric.latency].filter(Number.isFinite).slice(-10),
+        } : device));
       });
     }
 
     return () => {
-      if (socket) socket.off('deviceUpdated');
+      scanController.current?.abort();
+      if (socket) {
+        socket.off('deviceUpdated');
+        socket.off('metricAdded');
+      }
     };
-  }, []);
-
-  const fetchDevices = async () => {
-    setLoading(true);
-    try {
-      const res = await api.get('/devices');
-      setDevices(res.data);
-    } catch (error) {
-      console.error('Failed to fetch devices', error);
-    } finally {
-      setLoading(false);
-    }
-  };
+  }, [fetchDevices]);
 
   const handleCreateDevice = async (e) => {
     e.preventDefault();
@@ -93,7 +136,7 @@ const Devices = () => {
         location: '',
         description: '',
         monitoringMethod: 'icmp',
-        snmpCommunity: 'public'
+        snmpCommunity: ''
       });
     } catch (err) {
       console.error('Error adding device', err);
@@ -116,10 +159,16 @@ const Devices = () => {
 
   // Run subnet discovery
   const handleStartScan = async () => {
+    const cidr = window.prompt(
+      'Enter the exact CIDR approved by your administrator. It must also appear in the server DISCOVERY_ALLOWLIST (maximum 256 hosts):'
+    );
+    if (!cidr) return;
+    scanController.current?.abort();
+    scanController.current = new AbortController();
     setShowScanModal(true);
     setScanning(true);
     try {
-      const res = await api.get('/devices/discover');
+      const res = await api.post('/devices/discover', { cidr: cidr.trim() }, { signal: scanController.current.signal });
       setScanResults(res.data);
       // Preselect devices that are not yet enrolled
       const unenrolled = new Set(
@@ -127,9 +176,12 @@ const Devices = () => {
       );
       setSelectedIps(unenrolled);
     } catch (err) {
-      console.error('Scan failed', err);
-      alert('Failed to run subnet scan.');
+      if (err.code !== 'ERR_CANCELED') {
+        console.error('Discovery failed', err);
+        alert(err.response?.data?.message || 'Failed to run approved subnet discovery.');
+      }
     } finally {
+      scanController.current = null;
       setScanning(false);
     }
   };
@@ -160,16 +212,41 @@ const Devices = () => {
   };
 
   const filteredDevices = devices.filter(d => {
-    const matchesSearch = 
-      d.name.toLowerCase().includes(search.toLowerCase()) || 
-      d.ipAddress.includes(search) ||
-      (d.location && d.location.toLowerCase().includes(search.toLowerCase()));
+    const matchesSearch =
+      String(d.name || '').toLowerCase().includes(search.toLowerCase()) ||
+      String(d.ipAddress || '').includes(search) ||
+      String(d.location || '').toLowerCase().includes(search.toLowerCase());
 
     const matchesType = !typeFilter || d.type === typeFilter;
     const matchesStatus = !statusFilter || d.status === statusFilter;
+    const matchesSubnet = isInSubnet(d.ipAddress || '', subnetFilter.trim());
+    const matchesSeverity = !alertSeverityFilter || (d.alertCounts?.[alertSeverityFilter] || 0) > 0;
 
-    return matchesSearch && matchesType && matchesStatus;
+    return matchesSearch && matchesType && matchesStatus && matchesSubnet && matchesSeverity;
+  }).sort((left, right) => {
+    if (sortBy === 'name') return String(left.name).localeCompare(String(right.name));
+    const metric = (device) => device.latestMetric || {};
+    let leftValue;
+    let rightValue;
+    if (sortBy === 'latency') {
+      leftValue = metric(left).latency ?? Number.POSITIVE_INFINITY;
+      rightValue = metric(right).latency ?? Number.POSITIVE_INFINITY;
+    } else if (sortBy === 'throughput') {
+      leftValue = (metric(left).incomingTraffic ?? -1) + (metric(left).outgoingTraffic ?? -1);
+      rightValue = (metric(right).incomingTraffic ?? -1) + (metric(right).outgoingTraffic ?? -1);
+    } else if (sortBy === 'availability') {
+      leftValue = metric(left).availability ?? -1;
+      rightValue = metric(right).availability ?? -1;
+    } else {
+      leftValue = left.lastSeen ? new Date(left.lastSeen).getTime() : 0;
+      rightValue = right.lastSeen ? new Date(right.lastSeen).getTime() : 0;
+    }
+    return sortBy === 'latency' ? leftValue - rightValue : rightValue - leftValue;
   });
+  const pageSize = 24;
+  const totalPages = Math.max(1, Math.ceil(filteredDevices.length / pageSize));
+  const currentPage = Math.min(page, totalPages);
+  const pageDevices = filteredDevices.slice((currentPage - 1) * pageSize, currentPage * pageSize);
 
   const onlineCount = devices.filter(d => d.status === 'UP').length;
   const warningCount = devices.filter(d => d.status === 'WARNING').length;
@@ -185,7 +262,7 @@ const Devices = () => {
             Managed Hardware Fleet
           </h1>
           <p className="text-xs text-slate-500 mt-1">
-            Real-time ping telemetry, network nodes, and core routing inventory
+            Monitored network inventory with explicitly labelled telemetry sources
           </p>
         </div>
 
@@ -196,7 +273,7 @@ const Devices = () => {
             className="px-4 py-2.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-300 text-xs font-bold flex items-center gap-2 transition-all shadow-xs cursor-pointer"
           >
             <Radar className="w-4 h-4 text-emerald-600 animate-spin" style={{ animationDuration: '4s' }} /> 
-            Scan Local Network (Auto-Discover)
+            Discover Approved Subnet
           </button>
 
           {/* Add Device Button */}
@@ -264,6 +341,8 @@ const Devices = () => {
               <option value="router">Routers</option>
               <option value="switch">Switches</option>
               <option value="server">Servers</option>
+              <option value="pc">Workstations</option>
+              <option value="other">Other / unidentified</option>
             </select>
 
             <select 
@@ -275,6 +354,42 @@ const Devices = () => {
               <option value="UP">Online (UP)</option>
               <option value="WARNING">Degraded (WARNING)</option>
               <option value="DOWN">Offline (DOWN)</option>
+              <option value="UNKNOWN">Unknown</option>
+            </select>
+
+            <input
+              type="text"
+              value={subnetFilter}
+              onChange={event => setSubnetFilter(event.target.value)}
+              placeholder="Subnet (CIDR or prefix)"
+              aria-label="Filter by subnet"
+              className="w-36 bg-white border border-slate-300 text-slate-800 text-xs rounded-xl px-3 py-2"
+            />
+
+            <select
+              value={alertSeverityFilter}
+              onChange={event => setAlertSeverityFilter(event.target.value)}
+              aria-label="Filter by alert severity"
+              className="bg-white border border-slate-300 text-slate-800 text-xs rounded-xl px-3 py-2"
+            >
+              <option value="">All Alert Severities</option>
+              <option value="CRITICAL">Critical alert</option>
+              <option value="HIGH">High alert</option>
+              <option value="MEDIUM">Medium alert</option>
+              <option value="LOW">Low alert</option>
+            </select>
+
+            <select
+              value={sortBy}
+              onChange={event => setSortBy(event.target.value)}
+              aria-label="Sort devices"
+              className="bg-white border border-slate-300 text-slate-800 text-xs rounded-xl px-3 py-2"
+            >
+              <option value="name">Name</option>
+              <option value="latency">Latency</option>
+              <option value="throughput">Throughput</option>
+              <option value="availability">Availability</option>
+              <option value="lastSeen">Last seen</option>
             </select>
 
             <button 
@@ -289,110 +404,138 @@ const Devices = () => {
 
         {/* Device Table */}
         {loading ? (
-          <div className="py-20 text-center text-xs text-slate-400">Loading device registry...</div>
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 p-4">
+            {Array.from({ length: 6 }, (_, index) => (
+              <div key={index} className="h-52 rounded-2xl bg-slate-100 animate-pulse" />
+            ))}
+          </div>
+        ) : loadError ? (
+          <div className="py-16 text-center text-sm text-rose-700">
+            <p>{loadError}</p>
+            <button type="button" onClick={fetchDevices} className="mt-3 px-4 py-2 rounded-lg border border-rose-300 font-semibold">Retry</button>
+          </div>
         ) : filteredDevices.length === 0 ? (
           <div className="py-16 text-center text-slate-500 text-xs">
             <Server className="w-10 h-10 text-slate-400 mx-auto mb-3" />
             <p className="font-bold text-slate-700 text-sm">No matching network devices found</p>
-            <p className="mt-1">Try clicking "Scan Local Network (Auto-Discover)" to detect all active devices on your Wi-Fi.</p>
+            <p className="mt-1">Add a device or run discovery for an administrator-approved subnet.</p>
           </div>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse">
-              <thead>
-                <tr className="bg-slate-50 text-slate-500 text-[11px] font-bold uppercase tracking-wider border-b border-slate-200">
-                  <th className="px-5 py-3.5">Status</th>
-                  <th className="px-5 py-3.5">Device Identifier</th>
-                  <th className="px-5 py-3.5">Network IP</th>
-                  <th className="px-5 py-3.5">Hardware Role</th>
-                  <th className="px-5 py-3.5">Physical Location</th>
-                  <th className="px-5 py-3.5">Telemetry Ping</th>
-                  <th className="px-5 py-3.5 text-right">Actions</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100 text-xs">
-                {filteredDevices.map(device => {
-                  const isUp = device.status === 'UP';
-                  const isDown = device.status === 'DOWN';
-
-                  return (
-                    <tr key={device._id} className="hover:bg-slate-50/80 transition-colors group">
-                      <td className="px-5 py-3.5">
-                        <span className={clsx(
-                          "px-2.5 py-1 rounded-full text-[10px] font-bold tracking-wide uppercase flex items-center w-fit gap-1.5 border",
-                          isUp ? "bg-emerald-50 text-emerald-700 border-emerald-200" :
-                          isDown ? "bg-rose-50 text-rose-700 border-rose-200" :
-                          "bg-amber-50 text-amber-700 border-amber-200"
-                        )}>
-                          <span className={clsx(
-                            "w-1.5 h-1.5 rounded-full",
-                            isUp ? "bg-emerald-500 animate-pulse" :
-                            isDown ? "bg-rose-500 animate-pulse" : "bg-amber-500"
-                          )} />
-                          {device.status}
-                        </span>
-                      </td>
-
-                      <td className="px-5 py-3.5 font-bold text-slate-900">
-                        <div className="flex items-center gap-2.5">
-                          <div className="w-7 h-7 rounded-lg bg-slate-100 flex items-center justify-center text-sky-600 border border-slate-200">
-                            {device.type === 'router' ? <Router className="w-3.5 h-3.5" /> :
-                             device.type === 'server' ? <Server className="w-3.5 h-3.5" /> :
-                             <Wifi className="w-3.5 h-3.5" />}
-                          </div>
-                          <div>
-                            <span>{device.name}</span>
-                            {device.description && (
-                              <p className="text-[10px] text-slate-400 font-normal">{device.description}</p>
-                            )}
-                          </div>
+          <div className="p-4 sm:p-5">
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+              {pageDevices.map(device => {
+                const metric = device.latestMetric || {};
+                const isUp = device.status === 'UP';
+                const isDown = device.status === 'DOWN';
+                const latencySamples = (device.recentLatency || []).filter(Number.isFinite);
+                const maxLatency = Math.max(1, ...latencySamples);
+                return (
+                  <article key={device._id} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-xs">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex min-w-0 items-center gap-3">
+                        <div className="w-10 h-10 shrink-0 rounded-xl bg-slate-100 flex items-center justify-center text-sky-600 border border-slate-200">
+                          {device.type === 'router' ? <Router className="w-4 h-4" /> :
+                            device.type === 'server' ? <Server className="w-4 h-4" /> :
+                              <Wifi className="w-4 h-4" />}
                         </div>
-                      </td>
-
-                      <td className="px-5 py-3.5 font-mono">
-                        <span className="px-2 py-0.5 rounded bg-slate-100 border border-slate-200 text-slate-800 font-bold text-[11px]">
-                          {device.ipAddress}
-                        </span>
-                      </td>
-
-                      <td className="px-5 py-3.5 text-slate-600 capitalize font-medium">
-                        {device.type}
-                      </td>
-
-                      <td className="px-5 py-3.5 text-slate-500">
-                        <div className="flex items-center gap-1.5">
-                          <MapPin className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                          <span>{device.location || 'Server Rack A'}</span>
+                        <div className="min-w-0">
+                          <h2 className="truncate text-sm font-bold text-slate-900">{device.name}</h2>
+                          <p className="font-mono text-[11px] text-slate-500">{device.ipAddress}</p>
                         </div>
-                      </td>
+                      </div>
+                      <span className={clsx(
+                        'shrink-0 rounded-full border px-2 py-1 text-[10px] font-bold uppercase',
+                        isUp ? 'bg-emerald-50 text-emerald-700 border-emerald-200' :
+                          isDown ? 'bg-rose-50 text-rose-700 border-rose-200' :
+                            'bg-amber-50 text-amber-700 border-amber-200'
+                      )}>{device.status || 'UNKNOWN'}</span>
+                    </div>
 
-                      <td className="px-5 py-3.5 font-mono text-slate-500 text-[11px]">
-                        {device.lastSeen ? format(new Date(device.lastSeen), 'MMM d, HH:mm:ss') : 'Never'}
-                      </td>
+                    <div className="mt-3 flex items-center gap-1.5 text-[11px] text-slate-500">
+                      <MapPin className="h-3.5 w-3.5" />
+                      <span className="truncate">{device.location || 'Location unavailable'}</span>
+                      <span className="capitalize">· {device.type || 'Unclassified'}</span>
+                    </div>
 
-                      <td className="px-5 py-3.5 text-right">
-                        <div className="flex items-center justify-end gap-2">
-                          <Link 
-                            to={`/devices/${device._id}`}
-                            className="px-3 py-1.5 rounded-lg bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 text-[11px] font-bold transition-all inline-flex items-center gap-1"
-                          >
-                            Details <ChevronRight className="w-3 h-3" />
-                          </Link>
-                          
-                          <button
-                            onClick={() => handleDeleteDevice(device._id, device.name)}
-                            title="Delete Node"
-                            className="p-1.5 rounded-lg bg-slate-100 hover:bg-rose-50 text-slate-400 hover:text-rose-600 border border-slate-200 hover:border-rose-200 transition-colors cursor-pointer"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                    <div className="mt-4 grid grid-cols-3 gap-2 text-xs">
+                      <div className="rounded-lg bg-slate-50 p-2">
+                        <p className="text-[10px] uppercase text-slate-400">Latency</p>
+                        <p className="mt-1 font-mono font-bold text-slate-800">{metric.latency == null ? 'N/A' : `${metric.latency} ms`}</p>
+                      </div>
+                      <div className="rounded-lg bg-slate-50 p-2">
+                        <p className="text-[10px] uppercase text-slate-400">Packet loss</p>
+                        <p className="mt-1 font-mono font-bold text-slate-800">{metric.packetLoss == null ? 'N/A' : `${metric.packetLoss}%`}</p>
+                      </div>
+                      <div className="rounded-lg bg-slate-50 p-2">
+                        <p className="text-[10px] uppercase text-slate-400">RX / TX</p>
+                        <p className="mt-1 font-mono font-bold text-slate-800">{formatRate(metric.incomingTraffic)} / {formatRate(metric.outgoingTraffic)}</p>
+                      </div>
+                    </div>
+
+                    <div className="mt-3 flex h-7 items-end gap-1" aria-label="Recent latency sparkline">
+                      {latencySamples.length > 0 ? latencySamples.map((sample, index) => (
+                        <span
+                          key={`${device._id}-${index}`}
+                          className="flex-1 rounded-t bg-sky-400"
+                          style={{ height: `${Math.max(12, (sample / maxLatency) * 100)}%` }}
+                        />
+                      )) : <span className="text-[10px] text-slate-400">No latency history</span>}
+                    </div>
+
+                    <div className="mt-2 flex items-center justify-between gap-2 text-[10px] text-slate-500">
+                      <span>Last seen: {device.lastSeen ? format(new Date(device.lastSeen), 'MMM d, HH:mm:ss') : 'Never'}</span>
+                      <span className={device.activeAlertCount ? 'font-bold text-rose-700' : ''}>
+                        {device.activeAlertCount || 0} active alert{device.activeAlertCount === 1 ? '' : 's'}
+                      </span>
+                    </div>
+                    <div className="mt-1 space-y-0.5 text-[10px] text-slate-500">
+                      <p>
+                        Collection: {device.collectionStatus || metric.collectionStatus || (device.latestMetric ? 'unknown' : 'no_measurements')}
+                        {metric.measurementSource ? ` · ${metric.measurementSource}` : ''}
+                        {metric.createdAt ? ` · ${format(new Date(metric.createdAt), 'MMM d, HH:mm:ss')}` : ''}
+                      </p>
+                      {device.collectionReason && (
+                        <p className="break-words text-amber-700">{device.collectionReason}</p>
+                      )}
+                      {device.monitoringAuthorized === false && (
+                        <p className="break-words text-amber-700">
+                          Real monitoring is not allowlisted. Discovery approval does not authorize continuous monitoring.
+                        </p>
+                      )}
+                      {device.monitoringAuthorized === undefined && (
+                        <p className="break-words text-slate-500">Real monitoring authorization status unavailable.</p>
+                      )}
+                    </div>
+
+                    <div className="mt-3 flex items-center justify-between border-t border-slate-100 pt-3">
+                      <Link
+                        to={`/devices/${device._id}`}
+                        className="inline-flex items-center gap-1 rounded-lg border border-sky-200 bg-sky-50 px-3 py-1.5 text-[11px] font-bold text-sky-700"
+                      >
+                        View details <ChevronRight className="h-3 w-3" />
+                      </Link>
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteDevice(device._id, device.name)}
+                        title="Remove device"
+                        className="rounded-lg border border-slate-200 p-1.5 text-slate-500 hover:border-rose-200 hover:text-rose-600"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+            {totalPages > 1 && (
+              <div className="mt-4 flex items-center justify-between text-xs text-slate-600">
+                <span>{filteredDevices.length} matching devices · page {currentPage} of {totalPages}</span>
+                <div className="flex gap-2">
+                  <button type="button" disabled={currentPage === 1} onClick={() => setPage(currentPage - 1)} className="rounded-lg border px-3 py-1.5 disabled:opacity-40">Previous</button>
+                  <button type="button" disabled={currentPage === totalPages} onClick={() => setPage(currentPage + 1)} className="rounded-lg border px-3 py-1.5 disabled:opacity-40">Next</button>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -408,12 +551,15 @@ const Devices = () => {
                   <Radar className="w-5 h-5 animate-pulse" />
                 </div>
                 <div>
-                  <h3 className="text-base font-bold text-slate-900">Local Subnet Scanner (ARP & ICMP Sweep)</h3>
-                  <p className="text-xs text-slate-500">Detecting all real active private devices connected to your LAN</p>
+                  <h3 className="text-base font-bold text-slate-900">Administrator-Approved Subnet Discovery</h3>
+                  <p className="text-xs text-slate-500">Only the exact CIDR allowed by server configuration is probed. Device identity is not inferred.</p>
                 </div>
               </div>
               <button 
-                onClick={() => setShowScanModal(false)}
+                onClick={() => {
+                  scanController.current?.abort();
+                  setShowScanModal(false);
+                }}
                 className="text-slate-400 hover:text-slate-700 p-1 rounded-lg"
               >
                 <X className="w-5 h-5" />
@@ -423,8 +569,8 @@ const Devices = () => {
             {scanning ? (
               <div className="py-16 text-center space-y-3">
                 <div className="w-10 h-10 rounded-full border-2 border-emerald-200 border-t-emerald-600 animate-spin mx-auto" />
-                <p className="font-bold text-slate-800 text-sm">Sweeping your local network subnet...</p>
-                <p className="text-xs text-slate-400">Probing IP range & reading local ARP cache</p>
+                <p className="font-bold text-slate-800 text-sm">Probing the approved subnet...</p>
+                <p className="text-xs text-slate-400">Bounded ICMP probes only; no ARP sweep or port scan</p>
               </div>
             ) : scanResults ? (
               <div className="flex-1 overflow-y-auto space-y-4 pr-1">
@@ -435,7 +581,7 @@ const Devices = () => {
                     <span className="font-mono text-sky-700 font-bold">{scanResults.subnet}</span>
                   </div>
                   <div className="text-slate-500">
-                    Discovered <span className="font-bold text-emerald-700 font-mono">{scanResults.count}</span> Active Hardware Nodes
+                    Found <span className="font-bold text-emerald-700 font-mono">{scanResults.count}</span> responding IP addresses
                   </div>
                 </div>
 
@@ -471,10 +617,31 @@ const Devices = () => {
                               </span>
                             </div>
                             <div className="text-[10px] text-slate-400 font-mono mt-0.5 flex items-center gap-2">
-                              <span>MAC: {d.macAddress}</span>
-                              <span>•</span>
+                              <span>Identity not verified</span>
+                              <span>·</span>
                               <span>{d.location}</span>
                             </div>
+                            {d.deviceId && (
+                              <Link
+                                to={`/devices/${d.deviceId}`}
+                                onClick={(event) => event.stopPropagation()}
+                                className="mt-1 inline-block text-[10px] font-semibold text-sky-700 underline"
+                              >
+                                View enrolled device
+                              </Link>
+                            )}
+                            {d.isEnrolled && (
+                              <p className={`mt-1 break-words text-[10px] ${
+                                d.monitoringAuthorized && d.monitoringStatus ? 'text-emerald-700' : 'text-amber-700'
+                              }`}>
+                                {!d.monitoringStatus
+                                  ? 'Monitoring is paused.'
+                                  : d.monitoringAuthorized
+                                    ? 'Authorized for real monitoring.'
+                                    : d.monitoringAuthorizationReason}
+                                {' '}Discovery approval and enrollment do not grant monitoring authorization.
+                              </p>
+                            )}
                           </div>
                         </div>
 
@@ -511,7 +678,10 @@ const Devices = () => {
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => setShowScanModal(false)}
+                    onClick={() => {
+                      scanController.current?.abort();
+                      setShowScanModal(false);
+                    }}
                     className="px-4 py-2 rounded-xl bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 text-xs font-bold cursor-pointer"
                   >
                     Cancel

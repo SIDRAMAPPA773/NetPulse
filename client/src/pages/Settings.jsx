@@ -6,6 +6,7 @@ import clsx from 'clsx';
 const Settings = () => {
   const [settings, setSettings] = useState({
     SIMULATION_MODE: true,
+    EMERGENCY_STOP: false,
     LATENCY_WARNING: 100,
     LATENCY_CRITICAL: 250,
     PACKET_LOSS_WARNING: 5,
@@ -25,7 +26,8 @@ const Settings = () => {
       setSettings(prev => ({
         ...prev,
         ...res.data,
-        SIMULATION_MODE: Boolean(res.data.SIMULATION_MODE === true || res.data.SIMULATION_MODE === 'true')
+        SIMULATION_MODE: Boolean(res.data.SIMULATION_MODE === true || res.data.SIMULATION_MODE === 'true'),
+        EMERGENCY_STOP: Boolean(res.data.EMERGENCY_STOP === true || res.data.EMERGENCY_STOP === 'true')
       }));
     } catch (error) {
       console.error(error);
@@ -61,6 +63,7 @@ const Settings = () => {
   const handleResetDefaults = () => {
     setSettings({
       SIMULATION_MODE: true,
+      EMERGENCY_STOP: false,
       LATENCY_WARNING: 100,
       LATENCY_CRITICAL: 250,
       PACKET_LOSS_WARNING: 5,
@@ -125,6 +128,24 @@ const Settings = () => {
         </div>
       </div>
 
+      <div className="glass-card-static rounded-2xl border border-rose-300 bg-rose-50 overflow-hidden shadow-xs">
+        <label className="p-6 flex items-start gap-4 cursor-pointer">
+          <input
+            type="checkbox"
+            name="EMERGENCY_STOP"
+            checked={Boolean(settings.EMERGENCY_STOP)}
+            onChange={handleChange}
+            className="mt-1 w-5 h-5 rounded border-rose-300 text-rose-600 focus:ring-rose-500 cursor-pointer"
+          />
+          <div>
+            <h2 className="text-sm font-bold text-rose-800">Emergency stop for active probes</h2>
+            <p className="mt-1 text-xs text-rose-700">
+              When enabled, the monitoring engine starts no new ICMP or SNMP collection work. In-flight probes are bounded by their configured timeout.
+            </p>
+          </div>
+        </label>
+      </div>
+
       {/* Monitoring Engine Mode Card */}
       <div className="glass-card-static rounded-2xl border border-slate-200 overflow-hidden shadow-xs">
         <div className="p-6 border-b border-slate-200 flex items-center justify-between">
@@ -134,7 +155,7 @@ const Settings = () => {
             </div>
             <div>
               <h2 className="text-base font-bold text-slate-900">Telemetry Engine Mode</h2>
-              <p className="text-xs text-slate-500">Choose between simulated demonstration data or real hardware ICMP/SNMP probes</p>
+              <p className="text-xs text-slate-500">Choose simulated data or real probes restricted to server-approved targets</p>
             </div>
           </div>
         </div>
@@ -159,7 +180,7 @@ const Settings = () => {
                 </span>
               </div>
               <p className="text-xs text-slate-500 mt-1 leading-relaxed">
-                When enabled, the background engine synthesizes realistic randomized ping variations, interface octets, and occasional packet drops for demonstration. Uncheck this option to dispatch actual ICMP echo requests and SNMP OID queries across your local network.
+                When enabled, the engine generates clearly labelled simulation observations and sends no network probes. Real ICMP/SNMP collection remains disabled unless the target is present in the server MONITORING_TARGET_ALLOWLIST; discovery uses its separate DISCOVERY_ALLOWLIST. CPU and memory are unavailable unless a supported OID or authorized agent is configured.
               </p>
             </div>
           </label>

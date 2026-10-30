@@ -6,7 +6,10 @@ let socket = null;
 
 export const connectSocket = () => {
   if (!socket) {
-    socket = io(SOCKET_URL);
+    socket = io(SOCKET_URL, {
+      auth: { token: localStorage.getItem('token') },
+      reconnectionAttempts: 5,
+    });
   }
   return socket;
 };

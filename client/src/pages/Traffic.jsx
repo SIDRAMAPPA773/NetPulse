@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import api from '../services/api';
 import { 
   BarChart, 
@@ -12,16 +12,14 @@ import {
 } from 'recharts';
 import { ArrowLeftRight, ArrowDownLeft, ArrowUpRight, Zap, RefreshCw } from 'lucide-react';
 import clsx from 'clsx';
+import { mapTrafficRecords, summarizeTraffic } from '../services/trafficMetrics';
 
 const Traffic = () => {
   const [traffic, setTraffic] = useState([]);
+  const [unavailableDevices, setUnavailableDevices] = useState([]);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    fetchTraffic();
-  }, []);
-
-  const fetchTraffic = async () => {
+  const fetchTraffic = useCallback(async () => {
     setLoading(true);
     try {
       const [res, devicesRes] = await Promise.all([
@@ -29,33 +27,36 @@ const Traffic = () => {
         api.get('/devices')
       ]);
 
-      const devicesMap = devicesRes.data.reduce((acc, d) => {
-        acc[d._id] = d.name;
-        return acc;
-      }, {});
-
-      const formatted = res.data.map(t => {
-        const inKB = Math.round((t.avgIncoming || 0) / 1024);
-        const outKB = Math.round((t.avgOutgoing || 0) / 1024);
-        return {
-          name: devicesMap[t._id] || 'Node',
-          Incoming: inKB,
-          Outgoing: outKB,
-          total: inKB + outKB
-        };
-      });
-
+      const formatted = mapTrafficRecords(res.data, devicesRes.data);
+      const devicesWithThroughput = new Set(
+        formatted.filter(row => row.total !== null).map(row => row.deviceId),
+      );
+      setUnavailableDevices(devicesRes.data
+        .filter(device => !devicesWithThroughput.has(String(device._id)))
+        .map(device => ({
+          name: device.name,
+          ipAddress: device.ipAddress,
+          reason: device.monitoringAuthorized === false
+            ? device.monitoringAuthorizationReason
+            : device.latestMetric?.derived?.unavailableMetrics?.inboundThroughput
+              || device.latestMetric?.reasonUnavailable
+              || (device.latestMetric
+                ? 'No valid interface-counter throughput sample is available'
+                : 'No measurements recorded in the last 7 days'),
+        })));
       setTraffic(formatted);
     } catch (error) {
       console.error(error);
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
-  const totalIn = traffic.reduce((acc, t) => acc + t.Incoming, 0);
-  const totalOut = traffic.reduce((acc, t) => acc + t.Outgoing, 0);
-  const peakNode = traffic.length ? [...traffic].sort((a, b) => b.total - a.total)[0] : null;
+  useEffect(() => {
+    fetchTraffic();
+  }, [fetchTraffic]);
+
+  const { meanIncoming, meanOutgoing, busiestInterface, hasThroughputData } = summarizeTraffic(traffic);
 
   return (
     <div className="space-y-6 pb-12">
@@ -67,7 +68,7 @@ const Traffic = () => {
             Network Flow & Bandwidth Analytics
           </h1>
           <p className="text-xs text-slate-500 mt-1">
-            Real-time interface throughput, inbound ingress, and outbound egress telemetry
+            Average configured-interface throughput over one hour; real and simulated sources remain distinct
           </p>
         </div>
 
@@ -84,30 +85,30 @@ const Traffic = () => {
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
         <div className="glass-card rounded-2xl p-5 border border-slate-200 relative overflow-hidden">
           <div className="flex items-center justify-between text-xs text-slate-500 font-bold mb-2">
-            <span>AGGREGATE INBOUND (RX)</span>
+            <span>MEAN INBOUND (RX)</span>
             <ArrowDownLeft className="w-4 h-4 text-sky-600" />
           </div>
           <div className="flex items-baseline gap-1">
-            <span className="text-3xl font-extrabold text-slate-900 font-mono">{totalIn}</span>
-            <span className="text-xs text-slate-500 font-sans">KB/s</span>
+            <span className="text-3xl font-extrabold text-slate-900 font-mono">{meanIncoming === null ? 'Unavailable' : meanIncoming.toFixed(2)}</span>
+            {meanIncoming !== null && <span className="text-xs text-slate-500 font-sans">Mbit/s</span>}
           </div>
           <div className="mt-2 text-[11px] text-sky-700 font-semibold">
-            {(totalIn / 1024).toFixed(2)} MB/s total ingest
+            {meanIncoming === null ? 'No throughput data available' : `Mean of ${traffic.filter(row => row.Incoming !== null).length} available interfaces; not a campus-wide total`}
           </div>
           <div className="absolute bottom-0 left-0 right-0 h-1 bg-sky-500" />
         </div>
 
         <div className="glass-card rounded-2xl p-5 border border-slate-200 relative overflow-hidden">
           <div className="flex items-center justify-between text-xs text-slate-500 font-bold mb-2">
-            <span>AGGREGATE OUTBOUND (TX)</span>
+            <span>MEAN OUTBOUND (TX)</span>
             <ArrowUpRight className="w-4 h-4 text-emerald-600" />
           </div>
           <div className="flex items-baseline gap-1">
-            <span className="text-3xl font-extrabold text-slate-900 font-mono">{totalOut}</span>
-            <span className="text-xs text-slate-500 font-sans">KB/s</span>
+            <span className="text-3xl font-extrabold text-slate-900 font-mono">{meanOutgoing === null ? 'Unavailable' : meanOutgoing.toFixed(2)}</span>
+            {meanOutgoing !== null && <span className="text-xs text-slate-500 font-sans">Mbit/s</span>}
           </div>
           <div className="mt-2 text-[11px] text-emerald-700 font-semibold">
-            {(totalOut / 1024).toFixed(2)} MB/s total egress
+            Real and simulated values are separately labelled in the chart
           </div>
           <div className="absolute bottom-0 left-0 right-0 h-1 bg-emerald-500" />
         </div>
@@ -118,10 +119,10 @@ const Traffic = () => {
             <Zap className="w-4 h-4 text-purple-600" />
           </div>
           <div className="text-xl font-extrabold text-slate-900 truncate">
-            {peakNode ? peakNode.name : 'All Balanced'}
+            {busiestInterface ? busiestInterface.name : 'Unavailable'}
           </div>
           <div className="mt-2 text-[11px] text-purple-700 font-semibold font-mono">
-            {peakNode ? `${peakNode.total} KB/s combined traffic` : 'Normal threshold'}
+            {busiestInterface ? `${busiestInterface.total.toFixed(2)} Mbit/s combined on that interface` : 'No throughput data available'}
           </div>
           <div className="absolute bottom-0 left-0 right-0 h-1 bg-purple-500" />
         </div>
@@ -133,7 +134,7 @@ const Traffic = () => {
           <div>
             <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
               <ArrowLeftRight className="w-4 h-4 text-sky-600" />
-              Comparative Throughput by Hardware Node (KB/s)
+              Comparative Throughput by Configured Device Interface (Mbit/s)
             </h2>
             <p className="text-xs text-slate-500">Inbound (Blue) vs Outbound (Green) metrics</p>
           </div>
@@ -141,13 +142,15 @@ const Traffic = () => {
 
         {loading ? (
           <div className="py-24 text-center text-xs text-slate-400">Calculating network octets...</div>
+        ) : !hasThroughputData ? (
+          <div className="py-24 text-center text-sm text-slate-500">No throughput data available.</div>
         ) : (
           <div className="h-80 w-full">
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={traffic} margin={{ top: 20, right: 20, left: 0, bottom: 5 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false} />
                 <XAxis dataKey="name" stroke="#94a3b8" fontSize={11} tickLine={false} axisLine={false} />
-                <YAxis stroke="#94a3b8" fontSize={11} tickLine={false} axisLine={false} tickFormatter={v => `${v} KB/s`} />
+                <YAxis stroke="#94a3b8" fontSize={11} tickLine={false} axisLine={false} tickFormatter={v => `${v} Mbit/s`} />
                 <Tooltip 
                   contentStyle={{ backgroundColor: '#ffffff', borderColor: '#e2e8f0', borderRadius: '0.75rem', fontSize: '12px', color: '#0f172a' }}
                 />
@@ -156,6 +159,15 @@ const Traffic = () => {
                 <Bar dataKey="Outgoing" fill="#059669" radius={[4, 4, 0, 0]} name="Outbound (TX)" />
               </BarChart>
             </ResponsiveContainer>
+          </div>
+        )}
+        {!loading && unavailableDevices.length > 0 && (
+          <div className="space-y-1 border-t border-slate-100 pt-3 text-xs text-slate-500">
+            {unavailableDevices.map(device => (
+              <p key={device.ipAddress}>
+                <span className="font-semibold text-slate-700">{device.name} ({device.ipAddress}):</span> {device.reason}
+              </p>
+            ))}
           </div>
         )}
       </div>

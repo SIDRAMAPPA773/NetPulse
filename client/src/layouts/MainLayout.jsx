@@ -1,5 +1,5 @@
 import React, { useEffect, useContext, useState } from 'react';
-import { Outlet, Navigate } from 'react-router-dom';
+import { Outlet, Navigate, useLocation } from 'react-router-dom';
 import Sidebar from '../components/Sidebar';
 import Header from '../components/Header';
 import { AuthContext } from '../context/AuthContext';
@@ -7,7 +7,9 @@ import { connectSocket, disconnectSocket } from '../services/socket';
 
 const MainLayout = () => {
   const { user } = useContext(AuthContext);
+  const { pathname } = useLocation();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const isDeviceDetails = /^\/devices\/[^/]+$/.test(pathname);
 
   useEffect(() => {
     if (user) {
@@ -34,8 +36,8 @@ const MainLayout = () => {
       {/* Main Content Area */}
       <div className="flex flex-col flex-1 min-w-0 overflow-hidden relative z-10">
         <Header onToggleMobileMenu={() => setMobileMenuOpen(prev => !prev)} />
-        <main className="flex-1 overflow-y-auto px-4 sm:px-8 py-6 scroll-smooth">
-          <div className="max-w-7xl mx-auto">
+        <main className="min-w-0 flex-1 overflow-y-auto px-4 py-6 scroll-smooth sm:px-8">
+          <div className={isDeviceDetails ? 'mx-auto w-full min-w-0' : 'mx-auto max-w-7xl'}>
             <Outlet />
           </div>
         </main>

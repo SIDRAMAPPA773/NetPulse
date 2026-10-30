@@ -1,65 +1,155 @@
 import React, { useState } from 'react';
 import api from '../services/api';
 import { Download, FileText, FileSpreadsheet, Printer } from 'lucide-react';
-import clsx from 'clsx';
+import { toCsv } from '../services/csvExport';
 
 const Reports = () => {
   const [range, setRange] = useState('7d');
   const [reportType, setReportType] = useState('full');
   const [generating, setGenerating] = useState(false);
+  const [exportError, setExportError] = useState('');
 
-  const handleExportData = async (formatType) => {
+  const handleExportData = async (formatType, scope = reportType) => {
     setGenerating(true);
+    setExportError('');
     try {
-      const [devicesRes, summaryRes, alertsRes] = await Promise.all([
+      const [devicesRes, summaryRes, alertsRes, metricsRes] = await Promise.all([
         api.get('/devices'),
         api.get('/dashboard/summary'),
-        api.get('/alerts')
+        api.get('/alerts'),
+        api.get('/analytics/performance', { params: { range } })
       ]);
 
-      const reportData = {
+      const durationMs = { '24h': 24 * 60 * 60 * 1000, '7d': 7 * 24 * 60 * 60 * 1000, '30d': 30 * 24 * 60 * 60 * 1000 }[range];
+      const since = Date.now() - durationMs;
+      const recentAlerts = alertsRes.data
+        .filter(alert => new Date(alert.lastOccurredAt || alert.createdAt).getTime() >= since)
+        .slice(0, 100);
+      const devicesById = new Map(devicesRes.data.map(device => [device._id, device]));
+      const observations = metricsRes.data.map(metric => {
+        const device = devicesById.get(String(metric.device?._id || metric.device));
+        return {
+          ...metric,
+          deviceName: device?.name || null,
+          deviceIpAddress: device?.ipAddress || null,
+        };
+      });
+      const fullReport = {
         generatedAt: new Date().toISOString(),
+        range,
+        scope,
         networkOverview: summaryRes.data,
         devices: devicesRes.data,
-        recentAlerts: alertsRes.data.slice(0, 20)
+        observations,
+        recentAlerts
       };
+      const reportData = scope === 'inventory'
+        ? { generatedAt: fullReport.generatedAt, range, devices: devicesRes.data }
+        : scope === 'latency'
+          ? {
+            generatedAt: fullReport.generatedAt,
+            range,
+            observations: observations.filter(metric => metric.latency !== null && metric.latency !== undefined),
+          }
+          : fullReport;
 
       if (formatType === 'json') {
         const blob = new Blob([JSON.stringify(reportData, null, 2)], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `pulsenet_audit_report_${Date.now()}.json`;
+        a.download = `netpulse_${scope}_${range}_${Date.now()}.json`;
         a.click();
+        a.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 1000);
       } else {
-        const headers = ['Name', 'IP Address', 'Type', 'Status', 'Location', 'Last Seen'];
-        const rows = devicesRes.data.map(d => [
-          `"${d.name}"`,
-          `"${d.ipAddress}"`,
-          `"${d.type}"`,
-          `"${d.status}"`,
-          `"${d.location || ''}"`,
-          `"${d.lastSeen || ''}"`
-        ]);
-        const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+        const headers = ['Record Type', 'Timestamp', 'Device', 'IP Address', 'Status', 'Severity', 'Measurement Source', 'Latency (ms)', 'Packet Loss (%)', 'Inbound (bit/s)', 'Outbound (bit/s)', 'Details'];
+        const rows = scope === 'inventory'
+          ? devicesRes.data.map(device => [
+            'Device',
+            device.lastSeen || '',
+            device.name,
+            device.ipAddress,
+            device.status,
+            '',
+            device.latestMetric?.measurementSource || '',
+            device.latestMetric?.latency,
+            device.latestMetric?.packetLoss,
+            device.latestMetric?.incomingTraffic,
+            device.latestMetric?.outgoingTraffic,
+            JSON.stringify({ type: device.type, location: device.location, activeAlertCount: device.activeAlertCount }),
+          ])
+          : scope === 'latency'
+            ? reportData.observations.map(metric => {
+              return [
+                'Metric',
+                metric.createdAt,
+                metric.deviceName || 'Unknown device',
+                metric.deviceIpAddress || '',
+                metric.status,
+                '',
+                metric.measurementSource,
+                metric.latency,
+                metric.packetLoss,
+                metric.incomingThroughputBps,
+                metric.outgoingThroughputBps,
+                metric.reasonUnavailable,
+              ];
+            })
+            : [
+              ['Overview', fullReport.generatedAt, '', '', '', '', fullReport.networkOverview.measurementSource, fullReport.networkOverview.avgLatency, fullReport.networkOverview.avgPacketLoss, '', '', JSON.stringify(fullReport.networkOverview)],
+              ...observations.map(metric => {
+                return [
+                  'Metric',
+                  metric.createdAt,
+                  metric.deviceName || 'Unknown device',
+                  metric.deviceIpAddress || '',
+                  metric.status,
+                  '',
+                  metric.measurementSource,
+                  metric.latency,
+                  metric.packetLoss,
+                  metric.incomingThroughputBps,
+                  metric.outgoingThroughputBps,
+                  metric.reasonUnavailable,
+                ];
+              }),
+              ...recentAlerts.map(alert => [
+                'Alert',
+                alert.lastOccurredAt || alert.createdAt,
+                alert.device?.name || 'Unknown device',
+                alert.device?.ipAddress || '',
+                alert.status,
+                alert.severity,
+                '',
+                '',
+                '',
+                '',
+                '',
+                alert.message,
+              ]),
+            ];
+        const csvContent = toCsv(headers, rows);
         const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `pulsenet_devices_inventory_${Date.now()}.csv`;
+        a.download = `netpulse_${scope}_${range}_${Date.now()}.csv`;
         a.click();
+        a.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 1000);
       }
     } catch (err) {
       console.error('Failed to export report', err);
+      setExportError('Unable to generate the export. Check your connection and try again.');
     } finally {
       setGenerating(false);
     }
   };
 
-  const sampleReports = [
-    { name: 'Monthly Network SLA & Availability Report', date: 'October 2026', size: '2.4 MB', type: 'PDF' },
-    { name: 'Critical Incident Post-Mortem & Alert Log', date: 'Last 7 Days', size: '1.1 MB', type: 'CSV' },
-    { name: 'Bandwidth Peak Utilization & Capacity Plan', date: 'Q3 2026', size: '3.8 MB', type: 'PDF' },
+  const exportTemplates = [
+    { name: 'Device inventory and latest observations', scope: 'inventory', format: 'csv' },
+    { name: 'Stored telemetry and incident snapshot', scope: 'full', format: 'json' },
   ];
 
   return (
@@ -72,7 +162,7 @@ const Reports = () => {
             Audit Reports & Observability Logs
           </h1>
           <p className="text-xs text-slate-500 mt-1">
-            Export executive summaries, historical SLA compliance, and device inventory logs
+            Export authenticated inventory, bounded stored telemetry, and incident snapshots; unavailable values remain empty
           </p>
         </div>
 
@@ -102,7 +192,7 @@ const Reports = () => {
           </div>
           <div>
             <h2 className="text-base font-bold text-slate-900">Generate Custom Observability Report</h2>
-            <p className="text-xs text-slate-500">Configure time-range and metrics to synthesize compliance document</p>
+            <p className="text-xs text-slate-500">Export data currently stored by NetPulse. These reports do not certify an SLA.</p>
           </div>
         </div>
 
@@ -115,9 +205,8 @@ const Reports = () => {
               className="w-full bg-white border border-slate-300 text-slate-900 rounded-xl px-4 py-2.5 focus:outline-none focus:border-blue-500 cursor-pointer shadow-2xs font-medium"
             >
               <option value="24h">Last 24 Hours</option>
-              <option value="7d">Last 7 Days (Standard SLA)</option>
-              <option value="30d">Last 30 Days (Monthly Audit)</option>
-              <option value="90d">Last Quarter</option>
+              <option value="7d">Last 7 Days</option>
+              <option value="30d">Last 30 Days</option>
             </select>
           </div>
 
@@ -128,9 +217,9 @@ const Reports = () => {
               onChange={e => setReportType(e.target.value)}
               className="w-full bg-white border border-slate-300 text-slate-900 rounded-xl px-4 py-2.5 focus:outline-none focus:border-blue-500 cursor-pointer shadow-2xs font-medium"
             >
-              <option value="full">Comprehensive Full Audit (Availability + Alerts)</option>
-              <option value="latency">Round-Trip Latency & Jitter Only</option>
-              <option value="inventory">Asset Inventory & MAC Addressing</option>
+              <option value="full">Summary, observations, and recent alerts</option>
+              <option value="latency">Stored latency observations</option>
+              <option value="inventory">Device inventory and latest values</option>
             </select>
           </div>
 
@@ -140,32 +229,34 @@ const Reports = () => {
               disabled={generating}
               className="w-full py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold transition-all shadow-sm cursor-pointer"
             >
-              {generating ? 'Compiling Telemetry...' : 'Generate & Download'}
+              {generating ? 'Preparing export...' : 'Generate & Download'}
             </button>
           </div>
         </div>
+        {exportError && <p role="alert" className="text-xs font-semibold text-rose-700">{exportError}</p>}
       </div>
 
-      {/* Pre-packaged Audit Reports */}
+      {/* Available export templates */}
       <div className="glass-card-static rounded-2xl border border-slate-200 overflow-hidden">
         <div className="p-5 border-b border-slate-200">
-          <h3 className="text-sm font-bold text-slate-900">Archived Executive Reports</h3>
+          <h3 className="text-sm font-bold text-slate-900">Available on-demand exports</h3>
         </div>
         <div className="divide-y divide-slate-100 text-xs">
-          {sampleReports.map((item, idx) => (
-            <div key={idx} className="p-4 sm:px-6 flex items-center justify-between hover:bg-slate-50/80 transition-colors">
+          {exportTemplates.map(item => (
+            <div key={item.scope} className="p-4 sm:px-6 flex items-center justify-between hover:bg-slate-50/80 transition-colors">
               <div className="flex items-center gap-3">
                 <FileText className="w-5 h-5 text-sky-600" />
                 <div>
                   <p className="font-bold text-slate-900">{item.name}</p>
-                  <p className="text-[11px] text-slate-500 mt-0.5">{item.date} • {item.size}</p>
+                  <p className="text-[11px] text-slate-500 mt-0.5">Generated on demand · Selected range: {range}</p>
                 </div>
               </div>
               <button 
-                onClick={() => handleExportData('csv')}
+                onClick={() => handleExportData(item.format, item.scope)}
+                disabled={generating}
                 className="px-3 py-1.5 rounded-lg bg-white hover:bg-slate-100 text-sky-700 border border-slate-300 text-[11px] font-bold transition-colors cursor-pointer shadow-2xs"
               >
-                Download {item.type}
+                Download {item.format.toUpperCase()}
               </button>
             </div>
           ))}

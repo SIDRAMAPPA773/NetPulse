@@ -11,8 +11,17 @@ const deviceSchema = new mongoose.Schema({
   pollingInterval: { type: Number, default: 30 }, // in seconds
   snmpCommunity: { type: String },
   snmpVersion: { type: String, enum: ['1', '2c', '3'], default: '2c' },
+  snmpInterfaceIndex: { type: Number, min: 1 },
   status: { type: String, enum: ['UP', 'DOWN', 'WARNING', 'UNKNOWN'], default: 'UNKNOWN' },
   lastSeen: { type: Date },
-}, { timestamps: true });
+}, {
+  timestamps: true,
+  toJSON: {
+    transform: (document, result) => {
+      delete result.snmpCommunity;
+      return result;
+    },
+  },
+});
 
 module.exports = mongoose.model('Device', deviceSchema);

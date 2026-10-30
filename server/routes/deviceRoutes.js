@@ -18,7 +18,7 @@ router.route('/')
   .post(protect, admin, createDevice);
 
 // Network Auto-Discovery routes (placed before /:id)
-router.get('/discover', protect, discoverLocalDevices);
+router.post('/discover', protect, admin, discoverLocalDevices);
 router.post('/enroll-multiple', protect, admin, enrollMultipleDevices);
 
 router.route('/:id')

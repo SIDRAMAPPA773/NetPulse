@@ -1,64 +1,102 @@
 const Metric = require('../models/Metric');
 const Device = require('../models/Device');
+const mongoose = require('mongoose');
 
 const getPerformance = async (req, res) => {
   try {
     const { device, location, type, range } = req.query;
-    
-    let timeFilter = new Date();
-    if (range === '1h') timeFilter.setHours(timeFilter.getHours() - 1);
-    else if (range === '6h') timeFilter.setHours(timeFilter.getHours() - 6);
-    else if (range === '24h') timeFilter.setDate(timeFilter.getDate() - 1);
-    else if (range === '7d') timeFilter.setDate(timeFilter.getDate() - 7);
-    else if (range === '30d') timeFilter.setDate(timeFilter.getDate() - 30);
-    else timeFilter.setHours(timeFilter.getHours() - 1); // default 1h
+    const allowedRanges = ['1h', '6h', '24h', '7d', '30d'];
+    if (range && !allowedRanges.includes(range)) {
+      return res.status(400).json({ message: 'Range must be one of 1h, 6h, 24h, 7d, or 30d' });
+    }
+
+    const rangeMilliseconds = {
+      '1h': 60 * 60 * 1000,
+      '6h': 6 * 60 * 60 * 1000,
+      '24h': 24 * 60 * 60 * 1000,
+      '7d': 7 * 24 * 60 * 60 * 1000,
+      '30d': 30 * 24 * 60 * 60 * 1000,
+    };
+    const timeFilter = new Date(Date.now() - rangeMilliseconds[range || '1h']);
 
     // Build device filter
     const deviceFilter = {};
-    if (device) deviceFilter._id = device;
+    if (device) {
+      if (!mongoose.Types.ObjectId.isValid(device)) {
+        return res.status(400).json({ message: 'Invalid device ID' });
+      }
+      deviceFilter._id = device;
+    }
+    if (type && !['router', 'switch', 'server', 'pc', 'other'].includes(type)) {
+      return res.status(400).json({ message: 'Invalid device type' });
+    }
     if (location) deviceFilter.location = location;
     if (type) deviceFilter.type = type;
 
     let deviceIds = [];
-    if (Object.keys(deviceFilter).length > 0) {
+    const hasDeviceFilter = Object.keys(deviceFilter).length > 0;
+    if (hasDeviceFilter) {
       const devices = await Device.find(deviceFilter).select('_id');
       deviceIds = devices.map(d => d._id);
+      if (deviceIds.length === 0) return res.json([]);
     }
 
     const metricFilter = { createdAt: { $gte: timeFilter } };
-    if (deviceIds.length > 0) {
+    if (hasDeviceFilter) {
       metricFilter.device = { $in: deviceIds };
     }
 
-    // Since we don't want to send too much data, we could group it.
-    // For simplicity, let's just fetch and average locally or use aggregation.
-    const metrics = await Metric.find(metricFilter).sort({ createdAt: 1 });
-    
-    // Process metrics to format suitable for Recharts
-    // Let's group by a time bucket. For simplicity, just return raw if not too huge, 
-    // or aggregate. Let's return the raw metrics for now (limited to 500 for safety).
-    // A better approach is bucketing but we'll keep it simple.
-    
-    res.json(metrics);
+    const metrics = await Metric.find(metricFilter).sort({ createdAt: -1 }).limit(500);
+    res.json(metrics.reverse());
   } catch (error) {
-    res.status(500).json({ message: 'Server Error', error: error.message });
+    res.status(500).json({ message: 'Server Error' });
   }
 };
 
 const getTraffic = async (req, res) => {
   try {
     // Top devices by traffic in last 1 hour
-    let timeFilter = new Date();
-    timeFilter.setHours(timeFilter.getHours() - 1);
+    const timeFilter = new Date(Date.now() - 60 * 60 * 1000);
     
     const latestMetrics = await Metric.aggregate([
-      { $match: { createdAt: { $gte: timeFilter } } },
+      {
+        $match: {
+          createdAt: { $gte: timeFilter },
+          metricSchemaVersion: 2,
+          $or: [{ incomingThroughputBps: { $type: 'number' } }, { outgoingThroughputBps: { $type: 'number' } }],
+        },
+      },
       { $group: {
-          _id: "$device",
-          avgIncoming: { $avg: "$incomingTraffic" },
-          avgOutgoing: { $avg: "$outgoingTraffic" }
+          _id: {
+            device: '$device',
+            interfaceId: '$interfaceId',
+            measurementSource: '$measurementSource',
+            source: '$source',
+            sourceProtocol: '$sourceProtocol',
+            unit: '$unit',
+          },
+          avgIncoming: { $avg: "$incomingThroughputBps" },
+          avgOutgoing: { $avg: "$outgoingThroughputBps" },
+          sampleCount: { $sum: 1 },
+          latestCreatedAt: { $max: '$createdAt' },
         }
-      }
+      },
+      { $sort: { latestCreatedAt: -1 } },
+      { $limit: 100 },
+      {
+        $project: {
+          _id: '$_id.device',
+          interfaceId: '$_id.interfaceId',
+          measurementSource: '$_id.measurementSource',
+          source: '$_id.source',
+          sourceProtocol: '$_id.sourceProtocol',
+          unit: '$_id.unit',
+          avgIncoming: 1,
+          avgOutgoing: 1,
+          sampleCount: 1,
+          latestCreatedAt: 1,
+        },
+      },
     ]);
 
     res.json(latestMetrics);

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import api from '../services/api';
 import { getSocket } from '../services/socket';
@@ -106,6 +106,7 @@ const CustomTooltip = ({ active, payload, label }) => {
           <span className="w-2 h-2 rounded-full bg-sky-600" />
           Latency: {payload[0].value} ms
         </p>
+        <p className="text-slate-500">Source: {payload[0].payload.measurementSource}</p>
       </div>
     );
   }
@@ -117,7 +118,23 @@ const Dashboard = () => {
   const [devices, setDevices] = useState([]);
   const [alerts, setAlerts] = useState([]);
   const [latencyData, setLatencyData] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(true);
   const [timeRange, setTimeRange] = useState('1h');
+
+  const fetchDashboardData = useCallback(async () => {
+    try {
+      const [summaryRes, devicesRes, alertsRes] = await Promise.all([
+        api.get('/dashboard/summary'),
+        api.get('/devices'),
+        api.get('/alerts')
+      ]);
+      setSummary(summaryRes.data);
+      setDevices(devicesRes.data);
+      setAlerts(alertsRes.data.slice(0, 6));
+    } catch (error) {
+      console.error('Error fetching dashboard data:', error);
+    }
+  }, []);
 
   useEffect(() => {
     fetchDashboardData();
@@ -139,34 +156,35 @@ const Dashboard = () => {
         socket.off('newAlert');
       }
     };
-  }, []);
+  }, [fetchDashboardData]);
 
-  const fetchDashboardData = async () => {
-    try {
-      const [summaryRes, devicesRes, alertsRes] = await Promise.all([
-        api.get('/dashboard/summary'),
-        api.get('/devices'),
-        api.get('/alerts')
-      ]);
-      setSummary(summaryRes.data);
-      setDevices(devicesRes.data);
-      setAlerts(alertsRes.data.slice(0, 6));
-
-      const baseLat = summaryRes.data.avgLatency || 18;
-      const points = Array.from({ length: 24 }).map((_, i) => {
-        const timeAgo = (24 - i) * 2.5;
-        const d = new Date(Date.now() - timeAgo * 60000);
-        const variation = Math.sin(i / 3) * 6 + (Math.random() * 8 - 4);
-        return {
-          time: format(d, 'HH:mm'),
-          latency: Math.max(4, Math.round(baseLat + variation))
-        };
+  useEffect(() => {
+    let active = true;
+    api.get(`/analytics/performance?range=${timeRange}`)
+      .then(({ data }) => {
+        if (!active) return;
+        const points = data
+          .filter(metric => metric.latency !== null && metric.latency !== undefined)
+          .slice(-24)
+          .map(metric => ({
+            time: format(new Date(metric.createdAt), 'MMM d HH:mm'),
+            latency: metric.latency,
+            measurementSource: metric.measurementSource || 'unknown',
+          }));
+        setLatencyData(points);
+      })
+      .catch(error => {
+        console.error('Error fetching latency history:', error);
+        if (active) setLatencyData([]);
+      })
+      .finally(() => {
+        if (active) setHistoryLoading(false);
       });
-      setLatencyData(points);
-    } catch (error) {
-      console.error('Error fetching dashboard data:', error);
-    }
-  };
+
+    return () => {
+      active = false;
+    };
+  }, [timeRange]);
 
   if (!summary) {
     return (
@@ -180,12 +198,12 @@ const Dashboard = () => {
     );
   }
 
-  const healthScore = Math.max(0, Math.min(100, Math.round(
+  const hasHealthInputs = summary.avgPacketLoss !== null && summary.avgLatency !== null;
+  const healthScore = hasHealthInputs ? Math.max(0, Math.min(100, Math.round(
     100 - (summary.offlineDevices * 10) - (summary.avgPacketLoss * 2) - (summary.avgLatency > 80 ? 15 : 0)
-  )));
-
-  const healthGrade = healthScore >= 90 ? 'OPTIMAL' : healthScore >= 75 ? 'DEGRADED' : 'CRITICAL';
-  const healthColor = healthScore >= 90 ? '#059669' : healthScore >= 75 ? '#d97706' : '#e11d48';
+  ))) : null;
+  const healthGrade = healthScore === null ? 'NO DATA' : healthScore >= 90 ? 'OPTIMAL' : healthScore >= 75 ? 'DEGRADED' : 'CRITICAL';
+  const healthColor = healthScore === null ? '#94a3b8' : healthScore >= 90 ? '#059669' : healthScore >= 75 ? '#d97706' : '#e11d48';
 
   return (
     <div className="space-y-8 pb-12">
@@ -196,41 +214,41 @@ const Dashboard = () => {
           title="Monitored Fleet"
           value={summary.totalDevices}
           unit="Nodes"
-          subtitle="Managed network topology"
+          subtitle={`${summary.monitoringDevices} with polling enabled`}
           icon={Server}
           colorTheme="cyan"
-          trend="100% active"
-          trendGood={true}
+          trend={`${Math.round((summary.monitoringDevices / Math.max(1, summary.totalDevices)) * 100)}% enabled`}
+          trendGood={summary.monitoringDevices === summary.totalDevices}
         />
         <MetricCard
           title="Nodes Reachable"
-          value={summary.onlineDevices}
+          value={summary.reachableDevices}
           unit={`/ ${summary.totalDevices}`}
-          subtitle={`${summary.offlineDevices} Offline, ${summary.warningDevices} Warning`}
+          subtitle={`${summary.offlineDevices} offline, ${summary.unknownDevices} unknown`}
           icon={CheckCircle}
           colorTheme="emerald"
-          trend={`${Math.round((summary.onlineDevices / Math.max(1, summary.totalDevices)) * 100)}% up`}
+          trend={`${Math.round((summary.reachableDevices / Math.max(1, summary.totalDevices)) * 100)}% reachable`}
           trendGood={summary.offlineDevices === 0}
         />
         <MetricCard
           title="Average Latency"
-          value={summary.avgLatency || 0}
-          unit="ms"
+          value={summary.avgLatency ?? 'Unavailable'}
+          unit={summary.avgLatency === null ? '' : 'ms'}
           subtitle="Mean round-trip time"
           icon={Activity}
           colorTheme="amber"
-          trend={summary.avgLatency < 50 ? 'Sub-50ms' : 'Elevated'}
-          trendGood={summary.avgLatency < 50}
+          trend={summary.avgLatency === null ? 'No sample' : summary.avgLatency < 50 ? 'Sub-50ms' : 'Elevated'}
+          trendGood={summary.avgLatency !== null && summary.avgLatency < 50}
         />
         <MetricCard
           title="Packet Drop Rate"
-          value={summary.avgPacketLoss || 0}
-          unit="%"
-          subtitle="Global packet retention"
+          value={summary.avgPacketLoss ?? 'Unavailable'}
+          unit={summary.avgPacketLoss === null ? '' : '%'}
+          subtitle="Mean over latest valid observations"
           icon={AlertCircle}
-          colorTheme={summary.avgPacketLoss > 2 ? 'rose' : 'emerald'}
-          trend={summary.avgPacketLoss === 0 ? 'Zero Loss' : 'Drops detected'}
-          trendGood={summary.avgPacketLoss === 0}
+          colorTheme={summary.avgPacketLoss !== null && summary.avgPacketLoss > 2 ? 'rose' : 'emerald'}
+          trend={summary.avgPacketLoss === null ? 'No sample' : summary.avgPacketLoss === 0 ? 'No loss observed' : 'Loss detected'}
+          trendGood={summary.avgPacketLoss !== null && summary.avgPacketLoss === 0}
         />
       </div>
 
@@ -245,10 +263,11 @@ const Dashboard = () => {
                 <ShieldCheck className="w-5 h-5 text-sky-600" />
                 Network Health Index
               </h2>
-              <p className="text-xs text-slate-500 mt-0.5">Composite telemetry availability</p>
+              <p className="text-xs text-slate-500 mt-0.5">Heuristic indicator, not an SLA</p>
             </div>
             <span className={clsx(
               "px-2.5 py-1 text-[11px] font-bold tracking-wider uppercase rounded-full border",
+              healthScore === null ? "bg-slate-50 text-slate-600 border-slate-200" :
               healthScore >= 90 ? "bg-emerald-50 text-emerald-700 border-emerald-200" :
               healthScore >= 75 ? "bg-amber-50 text-amber-800 border-amber-200" :
               "bg-rose-50 text-rose-700 border-rose-200"
@@ -256,30 +275,35 @@ const Dashboard = () => {
               {healthGrade}
             </span>
           </div>
+          <p className="mt-2 text-[10px] leading-relaxed text-slate-500">
+            Formula: 100 − 10 × offline devices − 2 × average packet loss − 15 when latency exceeds 80 ms, clamped to 0–100. Unknown devices are excluded.
+          </p>
 
           {/* Donut Gauge */}
           <div className="relative w-48 h-48 mx-auto my-4 flex items-center justify-center">
-            <ResponsiveContainer width="100%" height="100%">
-              <PieChart>
-                <Pie
-                  data={[{ value: healthScore }, { value: 100 - healthScore }]}
-                  cx="50%"
-                  cy="50%"
-                  innerRadius={68}
-                  outerRadius={84}
-                  startAngle={90}
-                  endAngle={-270}
-                  dataKey="value"
-                  stroke="none"
-                >
-                  <Cell fill={healthColor} />
-                  <Cell fill="#f1f5f9" />
-                </Pie>
-              </PieChart>
-            </ResponsiveContainer>
+            {healthScore !== null && (
+              <ResponsiveContainer width="100%" height="100%">
+                <PieChart>
+                  <Pie
+                    data={[{ value: healthScore }, { value: 100 - healthScore }]}
+                    cx="50%"
+                    cy="50%"
+                    innerRadius={68}
+                    outerRadius={84}
+                    startAngle={90}
+                    endAngle={-270}
+                    dataKey="value"
+                    stroke="none"
+                  >
+                    <Cell fill={healthColor} />
+                    <Cell fill="#f1f5f9" />
+                  </Pie>
+                </PieChart>
+              </ResponsiveContainer>
+            )}
             
             <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
-              <span className="text-4xl font-black text-slate-900 font-mono tracking-tight">{healthScore}</span>
+              <span className="text-3xl font-black text-slate-900 font-mono tracking-tight">{healthScore ?? 'N/A'}</span>
               <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400 mt-0.5">SCORE / 100</span>
             </div>
           </div>
@@ -287,17 +311,17 @@ const Dashboard = () => {
           {/* Diagnostic Sub-metrics */}
           <div className="space-y-2.5 pt-4 border-t border-slate-100 text-xs">
             <div className="flex justify-between items-center">
-              <span className="text-slate-500 font-medium">Core Gateway SLA</span>
-              <span className="text-emerald-700 font-mono font-bold">99.98%</span>
+              <span className="text-slate-500 font-medium">Reachable in last poll</span>
+              <span className="text-slate-700 font-mono font-bold">{summary.reachableDevices} / {summary.totalDevices}</span>
             </div>
             <div className="flex justify-between items-center">
-              <span className="text-slate-500 font-medium">Switch Interconnects</span>
-              <span className="text-sky-700 font-mono font-bold">Synchronized</span>
+              <span className="text-slate-500 font-medium">Measurement source</span>
+              <span className="text-sky-700 font-mono font-bold uppercase">{summary.measurementSource}</span>
             </div>
             <div className="flex justify-between items-center">
-              <span className="text-slate-500 font-medium">Degraded Nodes</span>
+              <span className="text-slate-500 font-medium">Offline / unknown nodes</span>
               <span className={clsx("font-mono font-bold", summary.offlineDevices > 0 ? "text-rose-600" : "text-slate-700")}>
-                {summary.offlineDevices} detected
+                {summary.offlineDevices} / {summary.unknownDevices}
               </span>
             </div>
           </div>
@@ -312,17 +336,22 @@ const Dashboard = () => {
                   <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-sky-400 opacity-75"></span>
                   <span className="relative inline-flex rounded-full h-2 w-2 bg-sky-600"></span>
                 </span>
-                <h2 className="text-base font-bold text-slate-900">Live Round-Trip Latency Stream</h2>
+                <h2 className="text-base font-bold text-slate-900">Observed Round-Trip Latency</h2>
               </div>
-              <p className="text-xs text-slate-500 mt-0.5">Real-time ICMP ping echo response curve</p>
+              <p className="text-xs text-slate-500 mt-0.5">Stored observations; source is available in the tooltip</p>
             </div>
 
             {/* Range Pills */}
             <div className="flex items-center p-1 bg-slate-100 rounded-xl border border-slate-200 self-start sm:self-auto">
-              {['1h', '6h', '24h'].map(r => (
+              {['1h', '6h', '24h', '7d'].map(r => (
                 <button
                   key={r}
-                  onClick={() => setTimeRange(r)}
+                  onClick={() => {
+                    if (timeRange !== r) {
+                      setHistoryLoading(true);
+                      setTimeRange(r);
+                    }
+                  }}
                   className={clsx(
                     "px-3 py-1 text-xs font-bold rounded-lg transition-all cursor-pointer",
                     timeRange === r
@@ -337,6 +366,9 @@ const Dashboard = () => {
           </div>
 
           <div className="h-64 w-full">
+            {!historyLoading && latencyData.length === 0 ? (
+              <div className="flex h-full items-center justify-center text-sm text-slate-500">No latency observations in this time range.</div>
+            ) : (
             <ResponsiveContainer width="100%" height="100%">
               <AreaChart data={latencyData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
                 <defs>
@@ -365,6 +397,7 @@ const Dashboard = () => {
                 <Area 
                   type="monotone" 
                   dataKey="latency" 
+                  connectNulls={false}
                   stroke="#0284c7" 
                   strokeWidth={2.5} 
                   fillOpacity={1} 
@@ -372,6 +405,7 @@ const Dashboard = () => {
                 />
               </AreaChart>
             </ResponsiveContainer>
+            )}
           </div>
         </div>
 

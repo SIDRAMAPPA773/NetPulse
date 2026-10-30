@@ -10,7 +10,10 @@ const generateToken = (id) => {
 const loginUser = async (req, res) => {
   try {
     const { email, password } = req.body;
-    const user = await User.findOne({ email });
+    if (typeof email !== 'string' || typeof password !== 'string') {
+      return res.status(400).json({ message: 'Email and password are required' });
+    }
+    const user = await User.findOne({ email: email.trim().toLowerCase() });
 
     if (user && (await user.matchPassword(password))) {
       res.json({
@@ -30,8 +33,14 @@ const loginUser = async (req, res) => {
 
 const registerUser = async (req, res) => {
   try {
-    const { name, email, password, role } = req.body;
-    const userExists = await User.findOne({ email });
+    const { name, email, password } = req.body;
+    if (typeof name !== 'string' || !name.trim() || name.trim().length > 120 ||
+        typeof email !== 'string' || email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
+        typeof password !== 'string' || password.length < 12) {
+      return res.status(400).json({ message: 'Provide a name, valid email, and password with at least 12 characters' });
+    }
+    const normalizedEmail = email.trim().toLowerCase();
+    const userExists = await User.findOne({ email: normalizedEmail });
 
     if (userExists) {
       res.status(400).json({ message: 'User already exists' });
@@ -40,9 +49,9 @@ const registerUser = async (req, res) => {
 
     const user = await User.create({
       name,
-      email,
+      email: normalizedEmail,
       password,
-      role: role || 'viewer',
+      role: 'viewer',
     });
 
     if (user) {

@@ -3,8 +3,6 @@ const dotenv = require('dotenv');
 const connectDB = require('./config/db');
 const User = require('./models/User');
 const Device = require('./models/Device');
-const Metric = require('./models/Metric');
-const Alert = require('./models/Alert');
 const Setting = require('./models/Setting');
 
 dotenv.config();
@@ -12,29 +10,30 @@ dotenv.config();
 const seedData = async () => {
   try {
     await connectDB();
-    
-    await User.deleteMany();
-    await Device.deleteMany();
-    await Metric.deleteMany();
-    await Alert.deleteMany();
-    await Setting.deleteMany();
-
-    console.log('Data cleared');
-
-    await Setting.insertMany([
+    const defaults = [
       { key: 'SIMULATION_MODE', value: true },
+      { key: 'EMERGENCY_STOP', value: false },
       { key: 'LATENCY_WARNING', value: 100 },
       { key: 'LATENCY_CRITICAL', value: 250 },
       { key: 'PACKET_LOSS_WARNING', value: 5 },
       { key: 'PACKET_LOSS_CRITICAL', value: 15 },
-    ]);
+    ];
+    for (const setting of defaults) {
+      await Setting.updateOne({ key: setting.key }, { $setOnInsert: { value: setting.value } }, { upsert: true });
+    }
 
-    await User.create({
-      name: 'Admin User',
-      email: 'admin@college.edu',
-      password: 'password123',
-      role: 'admin'
-    });
+    const adminExists = await User.exists({ email: 'admin@college.edu' });
+    if (!adminExists) {
+      if (!process.env.ADMIN_INITIAL_PASSWORD) {
+        throw new Error('Set ADMIN_INITIAL_PASSWORD to create the initial admin account');
+      }
+      await User.create({
+        name: 'Admin User',
+        email: 'admin@college.edu',
+        password: process.env.ADMIN_INITIAL_PASSWORD,
+        role: 'admin',
+      });
+    }
 
     const devices = [
       { name: 'Core Router', ipAddress: '192.168.1.1', type: 'router', location: 'Server Room', description: 'Main college router' },
@@ -45,13 +44,16 @@ const seedData = async () => {
       { name: 'Admin Block Switch', ipAddress: '192.168.4.1', type: 'switch', location: 'Administration Block', description: '' },
     ];
 
-    await Device.insertMany(devices);
+    for (const device of devices) {
+      await Device.updateOne({ ipAddress: device.ipAddress }, { $setOnInsert: device }, { upsert: true });
+    }
 
-    console.log('Data seeded successfully');
-    process.exit();
+    console.log('Default settings and example devices are present; existing data was preserved');
   } catch (error) {
     console.error('Error seeding data', error);
-    process.exit(1);
+    process.exitCode = 1;
+  } finally {
+    await mongoose.disconnect();
   }
 };
 
