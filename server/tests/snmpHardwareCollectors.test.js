@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   HARDWARE_OIDS,
+  discoverSnmpInterfaces,
   parseHardwareVarbinds,
 } = require('../utils/snmpHardwareCollectors');
 
@@ -99,4 +100,34 @@ test('parseHardwareVarbinds rejects invalid CPU percentages and memory table val
   assert.equal(result.cpu.utilization, null);
   assert.equal(result.memory.utilization, null);
   assert.equal(result.memory.totalBytes, null);
+});
+
+test('discoverSnmpInterfaces returns indexes, names, operational state, and link speed from IF-MIB', async () => {
+  const session = {
+    subtree(oid, repetitions, feed, done) {
+      const rows = oid === '1.3.6.1.2.1.2.2.1'
+        ? [
+          { oid: `${oid}.2.3`, value: 'GigabitEthernet0/3' },
+          { oid: `${oid}.5.3`, value: 1_000_000_000 },
+          { oid: `${oid}.8.3`, value: 1 },
+        ]
+        : [
+          { oid: `${oid}.1.3`, value: 'Gi0/3' },
+          { oid: `${oid}.15.3`, value: 1000 },
+        ];
+      feed(rows);
+      done(null);
+    },
+  };
+
+  const result = await discoverSnmpInterfaces(session);
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(result.interfaces, [{
+    interfaceIndex: 3,
+    description: 'GigabitEthernet0/3',
+    speedBps: 1_000_000_000,
+    operationalStatus: 1,
+    name: 'Gi0/3',
+    highSpeedMbps: 1000,
+  }]);
 });

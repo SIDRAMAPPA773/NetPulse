@@ -178,10 +178,10 @@ const Subnets = () => {
       description: form.description,
       location: form.location,
       department: form.department,
+      autoEnroll: form.autoEnroll,
+      requireEnrollmentApproval: form.requireEnrollmentApproval,
       ...(editingSubnet ? {
         status: form.status,
-        autoEnroll: form.autoEnroll,
-        requireEnrollmentApproval: form.requireEnrollmentApproval,
         monitoringEnabled: form.monitoringEnabled,
         discoveryScheduleEnabled: form.discoveryScheduleEnabled,
         discoveryIntervalMinutes: Number(form.discoveryIntervalMinutes),
@@ -500,33 +500,29 @@ const Subnets = () => {
                     </select>
                   </label>
                 )}
-                {editingSubnet && (
+                <label className="flex items-center gap-2 text-xs font-semibold text-slate-700">
+                  <input type="checkbox" checked={form.autoEnroll} onChange={(event) => setForm({ ...form, autoEnroll: event.target.checked })} />
+                  Automatically enroll discovered devices
+                </label>
+                <label className="flex items-center gap-2 text-xs font-semibold text-slate-700">
+                  <input type="checkbox" checked={form.requireEnrollmentApproval} disabled={!form.autoEnroll} onChange={(event) => setForm({ ...form, requireEnrollmentApproval: event.target.checked })} />
+                  Require administrator approval before device monitoring
+                </label>
+                {editingSubnet?.status === 'active' && editingSubnet.approvalStatus === 'approved' && (
                   <>
                     <label className="flex items-center gap-2 text-xs font-semibold text-slate-700">
-                      <input type="checkbox" checked={form.autoEnroll} onChange={(event) => setForm({ ...form, autoEnroll: event.target.checked })} />
-                      Automatically enroll discovered devices
+                      <input type="checkbox" checked={form.monitoringEnabled} onChange={(event) => setForm({ ...form, monitoringEnabled: event.target.checked })} />
+                      Enable monitoring authorization for this subnet
                     </label>
                     <label className="flex items-center gap-2 text-xs font-semibold text-slate-700">
-                      <input type="checkbox" checked={form.requireEnrollmentApproval} disabled={!form.autoEnroll} onChange={(event) => setForm({ ...form, requireEnrollmentApproval: event.target.checked })} />
-                      Require administrator approval before device monitoring
+                      <input type="checkbox" checked={form.discoveryScheduleEnabled} onChange={(event) => setForm({ ...form, discoveryScheduleEnabled: event.target.checked })} />
+                      Enable scheduled discovery (does not run immediately)
                     </label>
-                    {editingSubnet.status === 'active' && editingSubnet.approvalStatus === 'approved' && (
-                      <>
-                        <label className="flex items-center gap-2 text-xs font-semibold text-slate-700">
-                          <input type="checkbox" checked={form.monitoringEnabled} onChange={(event) => setForm({ ...form, monitoringEnabled: event.target.checked })} />
-                          Enable monitoring authorization for this subnet
-                        </label>
-                        <label className="flex items-center gap-2 text-xs font-semibold text-slate-700">
-                          <input type="checkbox" checked={form.discoveryScheduleEnabled} onChange={(event) => setForm({ ...form, discoveryScheduleEnabled: event.target.checked })} />
-                          Enable scheduled discovery (does not run immediately)
-                        </label>
-                        {form.discoveryScheduleEnabled && (
-                          <label className="space-y-1 text-xs font-semibold text-slate-700">
-                            Discovery interval in minutes (15–10080)
-                            <input type="number" min={15} max={10080} required value={form.discoveryIntervalMinutes} onChange={(event) => setForm({ ...form, discoveryIntervalMinutes: Number(event.target.value) })} className="w-full rounded-xl border border-slate-300 px-3 py-2 font-normal" />
-                          </label>
-                        )}
-                      </>
+                    {form.discoveryScheduleEnabled && (
+                      <label className="space-y-1 text-xs font-semibold text-slate-700">
+                        Discovery interval in minutes (15–10080)
+                        <input type="number" min={15} max={10080} required value={form.discoveryIntervalMinutes} onChange={(event) => setForm({ ...form, discoveryIntervalMinutes: Number(event.target.value) })} className="w-full rounded-xl border border-slate-300 px-3 py-2 font-normal" />
+                      </label>
                     )}
                   </>
                 )}

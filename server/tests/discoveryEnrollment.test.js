@@ -134,6 +134,28 @@ test('approved discovered devices auto-enroll as pending and cannot be monitored
   assert.equal(result.devices[0].monitoringAuthorizationCode, 'ENROLLMENT_PENDING');
 });
 
+test('approved auto-enrollment enables polling only when enrollment and subnet monitoring are approved', async (t) => {
+  const fixture = installDiscoveryMocks(t, {
+    subnetOverrides: {
+      autoEnroll: true,
+      requireEnrollmentApproval: false,
+      monitoringEnabled: true,
+    },
+  });
+  const result = await runDiscoveryForSubnet({
+    subnetId: fixture.subnet._id,
+    requestedBy: 'admin-id',
+    options: { resolveDns: false, checkServices: false, ports: [] },
+  });
+
+  assert.equal(fixture.createdDevices.length, 1);
+  assert.equal(fixture.createdDevices[0].enrollmentStatus, 'approved');
+  assert.equal(fixture.createdDevices[0].monitoringStatus, true);
+  assert.equal(result.enrolledCount, 1);
+  assert.equal(result.pendingApprovalCount, 0);
+  assert.equal(result.devices[0].monitoringStatus, true);
+});
+
 test('pending subnets and empty discovery allowlists cannot start host probes', async (t) => {
   let probeCount = 0;
   const pendingFixture = installDiscoveryMocks(t, {
@@ -150,6 +172,7 @@ test('pending subnets and empty discovery allowlists cannot start host probes', 
   assert.equal(pendingFixture.job, undefined);
 
   const allowlistFixture = installDiscoveryMocks(t, {
+    settingOverrides: { NETWORK_AUTHORIZATION_POLICY: { mode: 'legacy_allowlists' } },
     probe: async () => {
       probeCount += 1;
       return { reachable: true, probeCount: 1 };

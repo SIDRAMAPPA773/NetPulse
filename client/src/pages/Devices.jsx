@@ -261,8 +261,8 @@ const Devices = () => {
 
   const updateDeviceAuthorization = async (device, updates) => {
     try {
-      const { data } = await api.put(`/devices/${device._id}`, updates);
-      setDevices((current) => current.map((item) => item._id === device._id ? { ...item, ...data } : item));
+      await api.put(`/devices/${device._id}`, updates);
+      await fetchDevices();
     } catch (error) {
       alert(error.response?.data?.message || 'Unable to update device authorization.');
     }

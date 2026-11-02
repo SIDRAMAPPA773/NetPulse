@@ -168,6 +168,7 @@ const Dashboard = () => {
 
   useEffect(() => {
     fetchDashboardData();
+    const refreshTimer = setInterval(fetchDashboardData, 15_000);
 
     const socket = getSocket();
     const handleDeviceUpdated = (device) => {
@@ -211,6 +212,7 @@ const Dashboard = () => {
         socket.off('newAlert', handleNewAlert);
         socket.off('metricAdded', handleMetricAdded);
       }
+      clearInterval(refreshTimer);
     };
   }, [fetchDashboardData, fetchMetricCoverage, timeRange]);
 
@@ -303,6 +305,7 @@ const Dashboard = () => {
   }
 
   const isSimulated = summary.measurementSource?.toLowerCase().includes('simulat');
+  const hasRecentRealTelemetry = !isSimulated && summary.hasRecentRealTelemetry === true;
   const hasHealthInputs = summary.avgPacketLoss !== null && summary.avgLatency !== null;
   const healthScore = hasHealthInputs ? Math.max(0, Math.min(100, Math.round(
     100 - (summary.offlineDevices * 10) - (summary.avgPacketLoss * 2) - (summary.avgLatency > 80 ? 15 : 0)
@@ -331,7 +334,7 @@ const Dashboard = () => {
             SYNTHETIC
           </span>
         </div>
-      ) : (
+      ) : hasRecentRealTelemetry ? (
         <div className="rounded-2xl border border-emerald-200 bg-emerald-50/60 p-4 flex items-center justify-between text-xs">
           <div className="flex items-center gap-3">
             <span className="p-2 rounded-xl bg-emerald-100 text-emerald-800 border border-emerald-200 shrink-0">
@@ -346,6 +349,23 @@ const Dashboard = () => {
           </div>
           <span className="px-2.5 py-1 rounded-full bg-emerald-200/80 text-emerald-900 text-[10px] font-mono font-bold tracking-wider shrink-0 uppercase border border-emerald-300">
             HARDWARE
+          </span>
+        </div>
+      ) : (
+        <div className="rounded-2xl border border-amber-200 bg-amber-50/70 p-4 flex items-center justify-between text-xs">
+          <div className="flex items-center gap-3">
+            <span className="p-2 rounded-xl bg-amber-100 text-amber-800 border border-amber-200 shrink-0">
+              <AlertTriangle className="w-4 h-4" />
+            </span>
+            <div>
+              <p className="font-bold text-amber-900 uppercase tracking-wide text-[11px]">No Recent Real Telemetry</p>
+              <p className="text-amber-800 text-xs mt-0.5">
+                No valid real measurement has been recorded in the last 60 seconds.
+              </p>
+            </div>
+          </div>
+          <span className="px-2.5 py-1 rounded-full bg-amber-200/80 text-amber-900 text-[10px] font-mono font-bold tracking-wider shrink-0 uppercase border border-amber-300">
+            NO DATA
           </span>
         </div>
       )}

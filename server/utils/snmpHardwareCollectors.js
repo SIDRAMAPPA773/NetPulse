@@ -133,6 +133,57 @@ async function collectHardwareTables(session, beforeRequest) {
   };
 }
 
+async function discoverSnmpInterfaces(session, beforeRequest) {
+  const [interfaceTable, interfaceExtensionTable] = await Promise.all([
+    boundedSubtree(session, '1.3.6.1.2.1.2.2.1', 512, beforeRequest),
+    boundedSubtree(session, '1.3.6.1.2.1.31.1.1.1', 512, beforeRequest),
+  ]);
+  const interfaces = new Map();
+  const readTable = (table, baseOid, columns) => {
+    const prefix = `${baseOid}.`;
+    for (const varbind of table.varbinds) {
+      if (snmp.isVarbindError(varbind)) continue;
+      if (!varbind.oid.startsWith(prefix)) continue;
+      const match = varbind.oid.slice(prefix.length).match(/^(\d+)\.(\d+)$/);
+      if (!match) continue;
+      const [, column, index] = match;
+      const property = columns[column];
+      if (!property) continue;
+      const entry = interfaces.get(Number(index)) || { interfaceIndex: Number(index) };
+      entry[property] = Buffer.isBuffer(varbind.value)
+        ? varbind.value.toString()
+        : varbind.value;
+      interfaces.set(Number(index), entry);
+    }
+  };
+  readTable(interfaceTable, '1.3.6.1.2.1.2.2.1', {
+    2: 'description',
+    5: 'speedBps',
+    7: 'adminStatus',
+    8: 'operationalStatus',
+  });
+  readTable(interfaceExtensionTable, '1.3.6.1.2.1.31.1.1.1', {
+    1: 'name',
+    15: 'highSpeedMbps',
+  });
+
+  const discovered = [...interfaces.values()]
+    .map((entry) => ({
+      ...entry,
+      name: entry.name || entry.description || `ifIndex ${entry.interfaceIndex}`,
+      speedBps: Number(entry.highSpeedMbps) > 0
+        ? Number(entry.highSpeedMbps) * 1_000_000
+        : Number(entry.speedBps) > 0
+          ? Number(entry.speedBps)
+          : null,
+    }))
+    .sort((left, right) => left.interfaceIndex - right.interfaceIndex);
+  return {
+    interfaces: discovered,
+    errors: [interfaceTable.error, interfaceExtensionTable.error].filter(Boolean),
+  };
+}
+
 function parseHardwareVarbinds(varbinds) {
   const values = {};
   const tableValues = new Map();
@@ -318,5 +369,6 @@ module.exports = {
   HARDWARE_OIDS,
   createSnmpSession,
   collectHardwareTables,
+  discoverSnmpInterfaces,
   parseHardwareVarbinds,
 };

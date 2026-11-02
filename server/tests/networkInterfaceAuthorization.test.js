@@ -121,7 +121,9 @@ test('network interface API reports pending, disabled, and environment-restricte
     { _id: 'approved', cidr: '192.168.50.0/24', status: 'active', approvalStatus: 'approved' },
   ];
   Subnet.find = () => ({ lean: async () => records });
-  Setting.findOne = async () => ({ value: 'dual' });
+  Setting.findOne = async ({ key }) => (key === 'NETWORK_AUTHORIZATION_POLICY'
+    ? { value: { mode: 'legacy_allowlists' } }
+    : { value: 'dual' });
   process.env.DISCOVERY_ALLOWLIST = '';
 
   const response = await getInterfaceResponse();

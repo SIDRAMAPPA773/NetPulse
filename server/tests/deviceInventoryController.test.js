@@ -61,10 +61,11 @@ test('device inventory separates an authorization-blocked collection from the la
   const originalAlertAggregate = Alert.aggregate;
   const originalSubnetFind = Subnet.find;
   const originalSettingFindOne = Setting.findOne;
+  let successfulMeasurementMatch;
   const successfulMeasurement = {
     createdAt: new Date('2025-01-01T00:00:00.000Z'),
-    measurementSource: 'simulated',
-    monitoringMode: 'simulation',
+    measurementSource: 'real',
+    monitoringMode: 'real',
   };
   const device = {
     _id: 'device-id',
@@ -95,6 +96,7 @@ test('device inventory separates an authorization-blocked collection from the la
   Metric.aggregate = async (pipeline) => {
     const match = pipeline.find((stage) => stage.$match);
     if (match.$match.availabilityStatus === 'available') {
+      successfulMeasurementMatch = match.$match;
       return [{ _id: device._id, latestSuccessfulMeasurement: successfulMeasurement }];
     }
     return [{
@@ -115,4 +117,5 @@ test('device inventory separates an authorization-blocked collection from the la
   assert.equal(responseBody[0].collectionStatus, 'blocked');
   assert.equal(responseBody[0].collectionReason, 'Target is not in MONITORING_TARGET_ALLOWLIST');
   assert.deepEqual(responseBody[0].latestSuccessfulMeasurement, successfulMeasurement);
+  assert.equal(successfulMeasurementMatch['reachability.isReachable'], true);
 });

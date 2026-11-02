@@ -76,12 +76,14 @@ const metricSchema = new mongoose.Schema({
   },
   health: {
     overallScore: { type: Number, default: null },
+    coveragePercent: { type: Number, default: null },
     healthStatus: { type: String, default: 'Unknown' },
     availabilityScore: { type: Number, default: null },
     performanceScore: { type: Number, default: null },
     trafficScore: { type: Number, default: null },
     hardwareScore: { type: Number, default: null },
     breakdown: [{ type: mongoose.Schema.Types.Mixed }],
+    explanation: { type: String },
   },
   tcp: {
     reachable: { type: Boolean },

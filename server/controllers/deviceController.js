@@ -28,6 +28,7 @@ const {
   getEffectiveDiscoveryAuthorizationMode,
 } = require('../utils/networkAuthorizationPolicy');
 const { encryptCredential } = require('../utils/snmpCredentialCrypto');
+const { testDeviceTelemetry } = require('../services/monitoringEngine');
 
 const publicDevice = (device) => {
   const result = device.toObject ? device.toObject() : { ...device };
@@ -44,17 +45,29 @@ const getDevices = async (req, res) => {
       .sort({ name: 1 })
       .limit(500);
     if (devices.length === 0) return res.json([]);
-    const [approvedSubnets, networkPolicySetting] = await Promise.all([
+    const [approvedSubnets, networkPolicySetting, simulationSetting] = await Promise.all([
       Subnet.find({ status: 'active', approvalStatus: 'approved' }).lean(),
       Setting.findOne({ key: 'NETWORK_AUTHORIZATION_POLICY' }),
+      Setting.findOne({ key: 'SIMULATION_MODE' }),
     ]);
     const networkAuthorizationPolicy = getNetworkAuthorizationPolicy(networkPolicySetting?.value);
+    const measurementSource = !simulationSetting
+      || simulationSetting.value === true
+      || simulationSetting.value === 'true'
+      ? 'simulated'
+      : 'real';
 
     const deviceIds = devices.map((device) => device._id);
     const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
     const [metricSummaries, successfulMeasurements, alertCounts] = await Promise.all([
       Metric.aggregate([
-        { $match: { device: { $in: deviceIds }, createdAt: { $gte: since } } },
+        {
+          $match: {
+            device: { $in: deviceIds },
+            measurementSource,
+            createdAt: { $gte: since },
+          },
+        },
         { $sort: { createdAt: -1 } },
         {
           $group: {
@@ -85,7 +98,16 @@ const getDevices = async (req, res) => {
         { $project: { latestMetric: 1, recentLatency: { $slice: ['$recentLatency', 10] } } },
       ]),
       Metric.aggregate([
-        { $match: { device: { $in: deviceIds }, availabilityStatus: 'available' } },
+        {
+          $match: {
+            device: { $in: deviceIds },
+            availabilityStatus: 'available',
+            measurementSource: 'real',
+            validity: 'valid',
+            'reachability.isReachable': true,
+            collectionStatus: { $in: ['success', 'timeout'] },
+          },
+        },
         { $sort: { createdAt: -1 } },
         {
           $group: {
@@ -237,24 +259,34 @@ const getDeviceById = async (req, res) => {
     const device = await Device.findById(req.params.id)
       .select('-snmpCommunity -snmpAuthKey -snmpPrivKey +telemetryDiagnostics');
     if (device) {
+      const [approvedSubnets, networkPolicySetting, simulationSetting] = await Promise.all([
+        Subnet.find({ status: 'active', approvalStatus: 'approved' }).lean(),
+        Setting.findOne({ key: 'NETWORK_AUTHORIZATION_POLICY' }),
+        Setting.findOne({ key: 'SIMULATION_MODE' }),
+      ]);
+      const networkAuthorizationPolicy = getNetworkAuthorizationPolicy(networkPolicySetting?.value);
+      const measurementSource = !simulationSetting
+        || simulationSetting.value === true
+        || simulationSetting.value === 'true'
+        ? 'simulated'
+        : 'real';
       const [latestCollection, latestSuccessfulMeasurement] = await Promise.all([
-        Metric.findOne({ device: device._id })
+        Metric.findOne({ device: device._id, measurementSource })
           .sort({ createdAt: -1 })
           .select('createdAt measurementSource collectionStatus availabilityStatus validity reasonUnavailable latency rttMin rttMax jitter packetLoss cpuUtilization memoryUtilization incomingThroughputBps outgoingThroughputBps interfaceId derived hardware health reachability tcp dns snmp telemetryChecks')
           .lean(),
         Metric.findOne({
           device: device._id,
           availabilityStatus: 'available',
+          measurementSource: 'real',
+          validity: 'valid',
+          'reachability.isReachable': true,
+          collectionStatus: { $in: ['success', 'timeout'] },
         })
           .sort({ createdAt: -1 })
           .select('createdAt measurementSource monitoringMode')
           .lean(),
       ]);
-      const [approvedSubnets, networkPolicySetting] = await Promise.all([
-        Subnet.find({ status: 'active', approvalStatus: 'approved' }).lean(),
-        Setting.findOne({ key: 'NETWORK_AUTHORIZATION_POLICY' }),
-      ]);
-      const networkAuthorizationPolicy = getNetworkAuthorizationPolicy(networkPolicySetting?.value);
       const monitoringSummary = createDeviceMonitoringSummary(
         publicDevice(device),
         latestCollection,
@@ -415,7 +447,8 @@ const updateDevice = async (req, res) => {
       return res.status(400).json({ message: 'enrollmentStatus must be pending or approved' });
     }
 
-    const device = await Device.findById(req.params.id);
+    const device = await Device.findById(req.params.id)
+      .select('+snmpCommunity +snmpAuthKey +snmpPrivKey +telemetryDiagnostics');
     if (!device) {
       return res.status(404).json({ message: 'Device not found' });
     }
@@ -453,6 +486,38 @@ const updateDevice = async (req, res) => {
     if (snmpPrivProtocol !== undefined) device.snmpPrivProtocol = snmpPrivProtocol;
     if (snmpPrivKey) device.snmpPrivKey = encryptCredential(snmpPrivKey);
     if (snmpContext !== undefined) device.snmpContext = snmpContext;
+    const snmpConfigurationChanged = [
+      'monitoringMethod',
+      'snmpCommunity',
+      'snmpVersion',
+      'snmpInterfaceIndex',
+      'snmpSecurityLevel',
+      'snmpSecurityName',
+      'snmpAuthProtocol',
+      'snmpAuthKey',
+      'snmpPrivProtocol',
+      'snmpPrivKey',
+      'snmpContext',
+    ].some((path) => device.isModified(path));
+    if (snmpConfigurationChanged) {
+      const pendingReason = 'SNMP configuration changed; run Test Telemetry to refresh collector status';
+      device.telemetryDiagnostics = {
+        status: 'NOT_TESTED',
+        reason: pendingReason,
+        snmpVersion: device.snmpVersion,
+        collectedAt: null,
+        checks: [],
+        interfaces: [],
+        collectors: {
+          cpu: { status: 'PENDING', reason: pendingReason },
+          memory: { status: 'PENDING', reason: pendingReason },
+          temperature: { status: 'PENDING', reason: pendingReason },
+          uptime: { status: 'PENDING', reason: pendingReason },
+          interface: { status: device.snmpInterfaceIndex ? 'PENDING' : 'NOT_CONFIGURED', reason: pendingReason },
+          agent: { status: 'NOT_CONFIGURED', reason: 'No authenticated Windows or Linux host exporter is configured' },
+        },
+      };
+    }
 
     if (device.monitoringStatus && device.enrollmentStatus === 'approved') {
       const [approvedSubnets, networkPolicySetting] = await Promise.all([
@@ -473,7 +538,29 @@ const updateDevice = async (req, res) => {
         return res.status(403).json({ message: authorization.reason, code: authorization.code });
       }
     }
-    const updatedDevice = await device.save();
+    let updatedDevice = await device.save();
+    if (
+      (
+        (previousEnrollmentStatus !== 'approved' && device.enrollmentStatus === 'approved')
+        || (previousMonitoringStatus !== true && device.monitoringStatus)
+      )
+      && device.monitoringStatus
+      && device.monitoringMethod === 'snmp'
+    ) {
+      const diagnostic = await testDeviceTelemetry(device);
+      const snmpData = diagnostic.snmp || {};
+      device.telemetryDiagnostics = {
+        status: diagnostic.status || diagnostic.errorCode || 'UNAVAILABLE',
+        reason: diagnostic.reason || diagnostic.message || null,
+        snmpVersion: diagnostic.snmpVersion || device.snmpVersion,
+        collectedAt: diagnostic.collectedAt || new Date(),
+        collectionDurationMs: diagnostic.collectionDurationMs || null,
+        checks: snmpData.oidChecks || [],
+        interfaces: snmpData.interfaces || [],
+        interfaceDiscoveryErrors: snmpData.interfaceDiscoveryErrors || [],
+      };
+      updatedDevice = await device.save();
+    }
     if (monitoringStatus !== undefined || enrollmentStatus !== undefined) {
       console.info(JSON.stringify({
         event: 'device.monitoring-authorization-updated',

@@ -99,6 +99,7 @@ const DeviceDetails = () => {
   const [range, setRange] = useState('1h');
   const [diagnosticBusy, setDiagnosticBusy] = useState(false);
   const [diagnosticMessage, setDiagnosticMessage] = useState('');
+  const [selectedInterfaceIndex, setSelectedInterfaceIndex] = useState('');
 
   useEffect(() => {
     let active = true;
@@ -117,6 +118,9 @@ const DeviceDetails = () => {
         setMetricCoverage(coverageRes.data);
         setLatestCollection(deviceRes.data.latestCollection);
         setLatestSuccessfulMeasurement(deviceRes.data.latestSuccessfulMeasurement);
+        setSelectedInterfaceIndex(deviceRes.data.snmpInterfaceIndex
+          ? String(deviceRes.data.snmpInterfaceIndex)
+          : '');
         setLoadError('');
       } catch (error) {
         if (active) {
@@ -180,7 +184,12 @@ const DeviceDetails = () => {
     );
   }
 
-  const chartData = [...metrics].reverse().map(m => ({
+  const realMetrics = metrics.filter(metric => (
+    metric.measurementSource === 'real'
+    && metric.validity === 'valid'
+    && ['success', 'timeout'].includes(metric.collectionStatus)
+  ));
+  const chartData = [...realMetrics].reverse().map(m => ({
     time: format(new Date(m.createdAt), range === '1h' ? 'HH:mm:ss' : 'MMM d HH:mm'),
     latency: m.latency ?? null,
     packetLoss: m.packetLoss ?? null,
@@ -192,23 +201,38 @@ const DeviceDetails = () => {
   const latestDerived = latestMetric.derived || {};
   const isUp = device.status === 'UP';
   const isDown = device.status === 'DOWN';
+  const monitoringState = !device.monitoringStatus
+    ? 'Monitoring disabled'
+    : device.enrollmentStatus !== 'approved'
+      ? 'Enrollment pending'
+      : !device.monitoringAuthorized
+        ? 'Monitoring authorization blocked'
+        : 'Monitoring enabled';
   const isAllowlistBlocked = latestMetric.reasonUnavailable === 'Target is not in MONITORING_TARGET_ALLOWLIST';
   const latestSuccessfulSample = latestSuccessfulMeasurement
-    || metrics.find(metric => metric.availabilityStatus === 'available');
+    || realMetrics.find(metric => metric.availabilityStatus === 'available' && metric.reachability?.isReachable === true);
   const lastSuccessfulAt = latestSuccessfulSample?.createdAt;
   const isLastSuccessfulMeasurementStale = lastSuccessfulAt
     && latestMetric.createdAt
     && new Date(latestMetric.createdAt).getTime() > new Date(lastSuccessfulAt).getTime();
 
-  const collectionExplanation = isAllowlistBlocked
-    ? 'No ICMP probe was run because this target is not authorized by MONITORING_TARGET_ALLOWLIST. This is an authorization block, not evidence that the device is unreachable.'
-    : latestMetric.collectionStatus === 'timeout' || latestMetric.collectionStatus === 'unreachable'
-      ? 'The latest authorized ICMP poll did not receive a response.'
-      : latestMetric.reasonUnavailable || (latestMetric.collectionStatus === 'unsupported'
-        ? 'The latest telemetry collection is unsupported.'
-        : latestMetric.collectionStatus === 'error'
-          ? 'The latest telemetry collection failed with an error.'
-          : null);
+  const hasLatestPollFailure = latestMetric.availabilityStatus === 'unavailable'
+    || latestMetric.reachability?.isReachable === false;
+  const collectionExplanation = (() => {
+    if (isAllowlistBlocked) {
+      return 'No ICMP probe was run because this target is not authorized by MONITORING_TARGET_ALLOWLIST. This is an authorization block, not evidence that the device is unreachable.';
+    }
+    if (latestMetric.reachability?.isReachable === false) {
+      return 'The authorized poll completed, but the device did not respond. Packet loss and latency reflect this failed reachability check.';
+    }
+    if (latestMetric.collectionStatus === 'timeout' || latestMetric.collectionStatus === 'unreachable') {
+      return 'The latest authorized ICMP poll did not receive a response.';
+    }
+    if (latestMetric.reasonUnavailable) return latestMetric.reasonUnavailable;
+    if (latestMetric.collectionStatus === 'unsupported') return 'The latest telemetry collection is unsupported.';
+    if (latestMetric.collectionStatus === 'error') return 'The latest telemetry collection failed with an error.';
+    return null;
+  })();
 
   const hardware = latestMetric.hardware || {};
   const health = latestMetric.health || {};
@@ -217,8 +241,15 @@ const DeviceDetails = () => {
     || latestMetric.snmp?.oidChecks?.find(check => check.metricId === metricId)?.reason
     || fallback
   );
-  const overallHealthScore = device.healthScore ?? health.overallScore ?? null;
-  const healthStatus = device.healthStatus || health.healthStatus || 'Unknown';
+  const hasCurrentHealthEvidence = latestMetric.measurementSource === 'real'
+    && latestMetric.validity === 'valid'
+    && ['success', 'timeout'].includes(latestMetric.collectionStatus)
+    && Number.isFinite(health.coveragePercent)
+    && health.overallScore !== null
+    && health.overallScore !== undefined;
+  const overallHealthScore = hasCurrentHealthEvidence ? health.overallScore : null;
+  const healthStatus = hasCurrentHealthEvidence ? health.healthStatus || 'Unknown' : 'Unknown';
+  const componentEvidence = (name) => health.breakdown?.find(component => component.name === name)?.coveragePercent;
   const telemetryDiagnostics = device.telemetryDiagnostics || (
     latestMetric.snmp?.oidChecks?.length
       ? {
@@ -230,9 +261,40 @@ const DeviceDetails = () => {
       }
       : null
   );
+  const snmpPollStatus = latestMetric.snmp
+    ? latestMetric.snmp.responded
+      ? 'AVAILABLE'
+      : latestMetric.snmp.errorCode || (latestMetric.snmp.supported ? 'UNAVAILABLE' : 'NOT CONFIGURED')
+    : device.monitoringMethod === 'snmp' ? 'NOT TESTED' : 'NOT_CONFIGURED';
+  const snmpPollReason = latestMetric.snmp?.reason
+    || latestMetric.snmp?.errorCode
+    || null;
+  const latestPollTimestamp = latestMetric.createdAt ? new Date(latestMetric.createdAt).getTime() : 0;
+  const diagnosticTimestamp = telemetryDiagnostics?.collectedAt
+    ? new Date(telemetryDiagnostics.collectedAt).getTime()
+    : 0;
+  const pendingConfigurationTimestamp = telemetryDiagnostics?.status === 'NOT_TESTED'
+    && !telemetryDiagnostics?.collectedAt
+    && device.updatedAt
+    ? new Date(device.updatedAt).getTime()
+    : 0;
+  const latestSnmpPollIsNewer = Boolean(
+    latestMetric.snmp
+    && latestPollTimestamp >= Math.max(diagnosticTimestamp, pendingConfigurationTimestamp),
+  );
+  const displayedSnmpStatus = latestSnmpPollIsNewer
+    ? snmpPollStatus
+    : telemetryDiagnostics?.status || snmpPollStatus;
+  const displayedSnmpReason = latestSnmpPollIsNewer
+    ? snmpPollReason
+    : telemetryDiagnostics?.reason || snmpPollReason;
   const telemetryCollector = (key, fallbackStatus, fallbackReason) => [
-    telemetryDiagnostics?.collectors?.[key]?.status || fallbackStatus,
-    telemetryDiagnostics?.collectors?.[key]?.reason || fallbackReason,
+    latestSnmpPollIsNewer
+      ? fallbackStatus
+      : telemetryDiagnostics?.collectors?.[key]?.status || fallbackStatus,
+    latestSnmpPollIsNewer
+      ? fallbackReason
+      : telemetryDiagnostics?.collectors?.[key]?.reason || fallbackReason,
   ];
   const runTelemetryDiagnostic = async () => {
     setDiagnosticBusy(true);
@@ -247,6 +309,19 @@ const DeviceDetails = () => {
       setDiagnosticMessage(message);
     } finally {
       setDiagnosticBusy(false);
+    }
+  };
+  const saveDiscoveredInterface = async () => {
+    if (!selectedInterfaceIndex) return;
+    try {
+      const { data } = await api.put(`/devices/${id}`, {
+        snmpInterfaceIndex: Number(selectedInterfaceIndex),
+      });
+      setDevice(current => ({ ...current, ...data }));
+      setDiagnosticMessage(`SNMP interface ${selectedInterfaceIndex} saved. Counters will be collected on the next authorized poll.`);
+    } catch (error) {
+      const message = error.response?.data?.message || 'Unable to save the selected SNMP interface.';
+      setDiagnosticMessage(message);
     }
   };
 
@@ -318,8 +393,8 @@ const DeviceDetails = () => {
 
         {/* Polling & Protocol badge */}
         <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-white border border-slate-200 text-xs text-slate-600 self-start sm:self-auto font-mono shadow-2xs">
-          <Radio className="w-3.5 h-3.5 text-sky-600 animate-pulse" />
-          <span>Polling: Every {device.pollingInterval || 30}s</span>
+          <Radio className={`w-3.5 h-3.5 ${monitoringState === 'Monitoring enabled' ? 'text-sky-600 animate-pulse' : 'text-slate-400'}`} />
+          <span>{monitoringState} · interval {device.pollingInterval || 30}s</span>
           {device.reachabilityMethod && (
             <span className="ml-1 uppercase font-bold text-indigo-700 bg-indigo-50 px-1.5 py-0.2 rounded border border-indigo-200 text-[10px]">
               {device.reachabilityMethod}
@@ -336,7 +411,7 @@ const DeviceDetails = () => {
               Bounded SNMP checks only; live diagnostics require an approved target and simulation mode off.
             </p>
           </div>
-          {user?.role === 'admin' && (
+          {user?.role === 'admin' && device.monitoringMethod === 'snmp' && (
             <button
               type="button"
               onClick={runTelemetryDiagnostic}
@@ -350,14 +425,14 @@ const DeviceDetails = () => {
         {diagnosticMessage && <p role="status" className="text-xs text-slate-600">{diagnosticMessage}</p>}
         <div className="grid gap-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
           {[
-            ['SNMP connectivity', telemetryDiagnostics?.status || (latestMetric.snmp?.responded ? 'AVAILABLE' : 'NOT TESTED'), telemetryDiagnostics?.reason],
-            ['SNMP version', telemetryDiagnostics?.snmpVersion || device.snmpVersion || 'Not configured', null],
+            ['SNMP connectivity', displayedSnmpStatus, displayedSnmpReason],
+            ['SNMP version', telemetryDiagnostics?.snmpVersion || (device.monitoringMethod === 'snmp' ? device.snmpVersion : 'Not configured'), null],
             ['Agent availability', ...telemetryCollector('agent', 'NOT_CONFIGURED', 'No authenticated Windows or Linux host exporter is configured')],
             ['CPU collector', ...telemetryCollector('cpu', hardware.availability?.cpu || 'UNSUPPORTED', hardware.cpu?.reason || 'No supported CPU collector returned a value')],
             ['Memory collector', ...telemetryCollector('memory', hardware.availability?.memory || 'UNSUPPORTED', hardware.memory?.reason || 'No supported physical-memory collector returned a value')],
             ['Temperature collector', ...telemetryCollector('temperature', hardware.availability?.temperature || 'UNSUPPORTED', hardware.temperature?.reason || 'No supported environmental sensor OID responded')],
             ['Uptime collector', ...telemetryCollector('uptime', hardware.availability?.uptime || 'UNAVAILABLE', hardware.system?.sysUpTime == null ? 'SNMPv2-MIB sysUpTime.0 was not returned' : null)],
-            ['Interface collector', ...telemetryCollector('interface', latestMetric.snmp?.countersSupported ? 'AVAILABLE' : 'NOT_CONFIGURED', latestMetric.snmp?.reason || 'Configure an interface index and supported IF-MIB counters')],
+            ['Interface collector', ...telemetryCollector('interface', latestMetric.snmp?.countersSupported ? 'AVAILABLE' : device.snmpInterfaceIndex ? 'UNAVAILABLE' : 'NOT_CONFIGURED', latestMetric.snmp?.reason || 'Select a discovered interface index and supported IF-MIB counters')],
           ].map(([label, value, reason]) => (
             <div key={label} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
               <p className="font-semibold uppercase tracking-wide text-slate-500">{label}</p>
@@ -366,6 +441,41 @@ const DeviceDetails = () => {
             </div>
           ))}
         </div>
+        {telemetryDiagnostics?.interfaces?.length > 0 && (
+          <div className="flex flex-col gap-2 border-t border-slate-100 pt-3 sm:flex-row sm:items-end">
+            <label className="flex-1 text-xs font-semibold text-slate-700">
+              Discovered SNMP interface
+              <select
+                value={selectedInterfaceIndex}
+                onChange={event => setSelectedInterfaceIndex(event.target.value)}
+                className="mt-1 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 font-normal"
+              >
+                <option value="">Select an interface</option>
+                {telemetryDiagnostics.interfaces.map(iface => (
+                  <option key={iface.interfaceIndex} value={iface.interfaceIndex}>
+                    {iface.interfaceIndex}: {iface.name} · {formatInterfaceStatus(iface.operationalStatus)}
+                    {iface.speedBps ? ` · ${formatBitRate(iface.speedBps)}` : ''}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {user?.role === 'admin' && (
+              <button
+                type="button"
+                onClick={saveDiscoveredInterface}
+                disabled={!selectedInterfaceIndex || Number(selectedInterfaceIndex) === Number(device.snmpInterfaceIndex)}
+                className="rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs font-bold text-sky-800 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Save interface
+              </button>
+            )}
+          </div>
+        )}
+        {telemetryDiagnostics?.interfaceDiscoveryErrors?.length > 0 && (
+          <p className="text-xs text-amber-700">
+            Interface discovery errors: {telemetryDiagnostics.interfaceDiscoveryErrors.join(', ')}
+          </p>
+        )}
         <div className="grid gap-2 text-xs text-slate-600 sm:grid-cols-2">
           <p>Last successful collection: {formatTimestamp(telemetryDiagnostics?.checks?.find(check => check.responseStatus === 'AVAILABLE')?.collectedAt)}</p>
           <p>Most recent failure: {telemetryDiagnostics?.checks?.find(check => check.reason)?.reason || telemetryDiagnostics?.reason || 'None recorded'}</p>
@@ -398,7 +508,7 @@ const DeviceDetails = () => {
           className={`w-full min-w-0 rounded-2xl border p-4 ${
             isAllowlistBlocked
               ? 'border-amber-200 bg-amber-50'
-              : latestMetric.availabilityStatus === 'unavailable'
+              : hasLatestPollFailure
                 ? 'border-rose-200 bg-rose-50'
                 : 'border-slate-200 bg-white'
           }`}
@@ -460,27 +570,31 @@ const DeviceDetails = () => {
           {[
             {
               name: 'Availability Score',
-              score: health.availabilityScore ?? (isUp ? 100 : (isDown ? 0 : null)),
+              score: health.availabilityScore ?? null,
+              coverage: componentEvidence('Availability'),
               metric: 'Reachability & Uptime',
-              status: isDown ? 'Critical' : isUp ? 'Healthy' : 'Unknown',
+              status: health.availabilityScore == null ? 'Unknown' : componentEvidence('Availability') < 100 ? 'Partial' : health.availabilityScore >= 80 ? 'Healthy' : health.availabilityScore >= 60 ? 'Warning' : 'Critical',
             },
             {
               name: 'Network Performance',
-              score: health.performanceScore ?? (latestMetric.latency !== null ? Math.max(0, 100 - (latestMetric.latency || 0) * 0.5 - (latestMetric.packetLoss || 0) * 2) : null),
+              score: health.performanceScore ?? null,
+              coverage: componentEvidence('Network Performance'),
               metric: `RTT ${latestMetric.latency ?? '—'}ms · Loss ${latestMetric.packetLoss ?? '—'}%`,
-              status: latestMetric.latency !== null ? (latestMetric.latency < 100 ? 'Healthy' : 'Degraded') : 'Excluded',
+              status: health.performanceScore == null ? 'Excluded' : componentEvidence('Network Performance') < 100 ? 'Partial' : health.performanceScore >= 80 ? 'Healthy' : health.performanceScore >= 60 ? 'Warning' : 'Critical',
             },
             {
               name: 'Traffic Health',
               score: health.trafficScore ?? null,
+              coverage: componentEvidence('Traffic Health'),
               metric: latestMetric.incomingThroughputBps !== null ? formatBitRate(latestMetric.incomingThroughputBps) : 'SNMP IF-MIB needed',
-              status: health.trafficScore !== null ? (health.trafficScore >= 80 ? 'Healthy' : 'Warning') : 'Excluded',
+              status: health.trafficScore == null ? 'Excluded' : componentEvidence('Traffic Health') < 100 ? 'Partial' : health.trafficScore >= 80 ? 'Healthy' : 'Warning',
             },
             {
               name: 'Hardware Health',
               score: health.hardwareScore ?? null,
+              coverage: componentEvidence('Hardware Health'),
               metric: latestMetric.cpuUtilization !== null ? `CPU: ${latestMetric.cpuUtilization}% · RAM: ${latestMetric.memoryUtilization ?? '—'}%` : 'SNMP OIDs needed',
-              status: health.hardwareScore !== null ? (health.hardwareScore >= 80 ? 'Healthy' : 'Warning') : 'Excluded',
+              status: health.hardwareScore == null ? 'Excluded' : componentEvidence('Hardware Health') < 100 ? 'Partial' : health.hardwareScore >= 80 ? 'Healthy' : 'Warning',
             },
           ].map((comp) => (
             <div key={comp.name} className="rounded-xl bg-slate-50/80 p-3.5 border border-slate-200/80">
@@ -491,13 +605,16 @@ const DeviceDetails = () => {
                 </span>
               </div>
               <p className="text-[11px] text-slate-500 mt-1">{comp.metric}</p>
+              {comp.coverage !== undefined && (
+                <p className="mt-1 text-[10px] text-slate-500">Evidence coverage: {comp.coverage}%</p>
+              )}
               <div className="mt-2.5 flex items-center justify-between text-[10px]">
                 <span className="text-slate-400 uppercase font-semibold">Status</span>
                 <span className={clsx(
                   "font-bold uppercase px-1.5 py-0.2 rounded",
                   comp.status === 'Healthy' ? "text-emerald-700 bg-emerald-50" :
                   comp.status === 'Critical' ? "text-rose-700 bg-rose-50" :
-                  comp.status === 'Degraded' || comp.status === 'Warning' ? "text-amber-700 bg-amber-50" :
+                  comp.status === 'Degraded' || comp.status === 'Warning' || comp.status === 'Partial' ? "text-amber-700 bg-amber-50" :
                   "text-slate-500 bg-slate-200"
                 )}>
                   {comp.status}
@@ -506,6 +623,17 @@ const DeviceDetails = () => {
             </div>
           ))}
         </div>
+        {health.coveragePercent !== null && health.coveragePercent !== undefined && (
+          <p className="text-xs text-slate-600">
+            Evidence coverage: {health.coveragePercent}%.
+            {health.explanation ? ` ${health.explanation}.` : ' Missing components remain unavailable and limit the maximum overall score.'}
+          </p>
+        )}
+        {overallHealthScore === null && (
+          <p className="text-xs text-slate-600">
+            Health status: {healthStatus}. {health.explanation || 'No verified measurements are available to calculate an overall health score.'}
+          </p>
+        )}
       </section>
 
       {/* Network Metrics Overview Strip */}

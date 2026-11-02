@@ -156,12 +156,21 @@ test('subnet API validates, persists, authorizes, approves, disables and deletes
   assert.equal(oversized.status, 400);
   const unsafe = await request('', 'POST', adminToken, { name: 'Loopback', cidr: '127.0.0.0/24' });
   assert.equal(unsafe.status, 400);
+  const invalidEnrollmentSetting = await request('', 'POST', adminToken, {
+    name: 'Invalid enrollment config',
+    cidr: '192.168.49.0/24',
+    autoEnroll: 'true',
+  });
+  assert.equal(invalidEnrollmentSetting.status, 400);
+  assert.match((await invalidEnrollmentSetting.json()).message, /autoEnroll must be a boolean/);
 
   const createdResponse = await request('', 'POST', adminToken, {
     name: 'Engineering',
     cidr: '192.168.50.0/24',
     location: 'Building A',
     department: 'Engineering',
+    autoEnroll: true,
+    requireEnrollmentApproval: true,
   });
   assert.equal(createdResponse.status, 201);
   const created = await createdResponse.json();
@@ -173,6 +182,8 @@ test('subnet API validates, persists, authorizes, approves, disables and deletes
   assert.equal(created.totalAddressCount, 256);
   assert.equal(created.usableHostCount, 254);
   assert.equal(created.subnetMask, '255.255.255.0');
+  assert.equal(created.autoEnroll, true);
+  assert.equal(created.requireEnrollmentApproval, true);
   assert.equal(records.length, 1);
 
   const duplicate = await request('', 'POST', adminToken, { name: 'Duplicate', cidr: '192.168.50.0/24' });

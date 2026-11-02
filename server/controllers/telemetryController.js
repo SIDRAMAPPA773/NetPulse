@@ -76,6 +76,8 @@ const testTelemetry = async (req, res) => {
       collectionDurationMs: diagnostic.collectionDurationMs,
       checks,
       collectors,
+      interfaces: diagnostic.snmp.interfaces || [],
+      interfaceDiscoveryErrors: diagnostic.snmp.interfaceDiscoveryErrors || [],
     };
     await device.save();
 
@@ -88,6 +90,8 @@ const testTelemetry = async (req, res) => {
       collectionDurationMs: diagnostic.collectionDurationMs,
       checks,
       collectors,
+      interfaces: diagnostic.snmp.interfaces || [],
+      interfaceDiscoveryErrors: diagnostic.snmp.interfaceDiscoveryErrors || [],
     });
   } catch (error) {
     console.error('Telemetry diagnostic failed:', error.name || 'UnknownError');

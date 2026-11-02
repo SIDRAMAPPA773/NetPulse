@@ -97,6 +97,7 @@ const getDeviceMetrics = async (req, res) => {
 const getDashboardSummary = async (req, res) => {
   try {
     const totalDevices = await Device.countDocuments();
+    const deviceIds = await Device.distinct('_id');
     const monitoringDevices = await Device.countDocuments({ monitoringStatus: true });
     const onlineDevices = await Device.countDocuments({ status: 'UP' });
     const offlineDevices = await Device.countDocuments({ status: 'DOWN' });
@@ -106,13 +107,30 @@ const getDashboardSummary = async (req, res) => {
     const measurementSource = !simulationSetting || simulationSetting.value === true || simulationSetting.value === 'true'
       ? 'simulated'
       : 'real';
+    const recentRealMeasurement = measurementSource === 'real'
+      ? await Metric.findOne({
+        device: { $in: deviceIds },
+        measurementSource: 'real',
+        collectionStatus: { $in: ['success', 'timeout'] },
+        validity: 'valid',
+        createdAt: { $gte: new Date(Date.now() - 60_000) },
+      }).sort({ createdAt: -1 }).select('createdAt').lean()
+      : null;
     
     // Get latest metrics for averages
+    const latestMetricFilter = measurementSource === 'real'
+      ? {
+        measurementSource,
+        validity: 'valid',
+        collectionStatus: { $in: ['success', 'timeout'] },
+      }
+      : { measurementSource };
     const latestMetrics = await Metric.aggregate([
       {
         $match: {
+          device: { $in: deviceIds },
           createdAt: { $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
-          measurementSource,
+          ...latestMetricFilter,
         },
       },
       { $sort: { createdAt: -1 } },
@@ -173,6 +191,8 @@ const getDashboardSummary = async (req, res) => {
       avgCpu,
       avgMemory,
       measurementSource,
+      hasRecentRealTelemetry: Boolean(recentRealMeasurement),
+      latestRealMeasurementAt: recentRealMeasurement?.createdAt || null,
     });
   } catch (error) {
     res.status(500).json({ message: 'Server Error' });

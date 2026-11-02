@@ -1,7 +1,6 @@
 const cron = require('node-cron');
 const snmp = require('net-snmp');
 const Device = require('../models/Device');
-const Collector = require('../models/Collector');
 const Subnet = require('../models/Subnet');
 const Metric = require('../models/Metric');
 const Alert = require('../models/Alert');
@@ -29,6 +28,7 @@ const {
   HARDWARE_OIDS,
   createSnmpSession,
   collectHardwareTables,
+  discoverSnmpInterfaces,
   parseHardwareVarbinds,
 } = require('../utils/snmpHardwareCollectors');
 const { calculateOverallHealthScore } = require('../utils/healthScoreEngine');
@@ -127,7 +127,9 @@ function classifySnmpError(error) {
 }
 
 function metricIdForOid(oid) {
+  if (oid === HARDWARE_OIDS.sysDescr) return 'system_description';
   if (oid === HARDWARE_OIDS.sysUpTime) return 'device_uptime';
+  if (oid === HARDWARE_OIDS.sysName) return 'system_name';
   if (oid.startsWith('1.3.6.1.4.1.2021.11.') || oid.startsWith('1.3.6.1.4.1.9.9.109.')) return 'cpu_utilization';
   if (oid.startsWith('1.3.6.1.4.1.2021.4.')) return 'memory_utilization';
   if (oid.startsWith('1.3.6.1.4.1.9.9.13.')) return 'temperature';
@@ -325,9 +327,21 @@ async function collectSnmp(device, options = {}) {
         if (varbind.oid === `1.3.6.1.2.1.2.2.1.2.${ifIndex}`) {
           interfaceName = String(varbind.value);
         } else {
-          values[varbind.oid] = varbind.oid.startsWith('1.3.6.1.2.1.31.1.1.1.')
-            ? exactCounterValue(varbind.value)
-            : numericValue(varbind.value);
+          const isSystemText = [
+            HARDWARE_OIDS.sysDescr,
+            HARDWARE_OIDS.sysName,
+          ].includes(varbind.oid);
+          if (isSystemText) {
+            values[varbind.oid] = Buffer.isBuffer(varbind.value)
+              ? varbind.value.toString()
+              : typeof varbind.value === 'string'
+                ? varbind.value
+                : null;
+          } else {
+            values[varbind.oid] = varbind.oid.startsWith('1.3.6.1.2.1.31.1.1.1.')
+              ? exactCounterValue(varbind.value)
+              : numericValue(varbind.value);
+          }
         }
         check.value = values[varbind.oid] ?? String(varbind.value);
         oidChecks.push(check);
@@ -344,7 +358,12 @@ async function collectSnmp(device, options = {}) {
       const data = {
         supported: true,
         responded: true,
+        sysDescr: values[HARDWARE_OIDS.sysDescr] ?? null,
+        sysName: values[HARDWARE_OIDS.sysName] ?? null,
         sysUpTime: values['1.3.6.1.2.1.1.3.0'] ?? null,
+        identityVerified: [HARDWARE_OIDS.sysDescr, HARDWARE_OIDS.sysName].some((oid) => (
+          typeof values[oid] === 'string' && values[oid].trim().length > 0
+        )),
         ifIndex: Number.isInteger(ifIndex) && ifIndex > 0 ? ifIndex : null,
         interfaceName,
         inOctets,
@@ -378,6 +397,13 @@ async function collectSnmp(device, options = {}) {
       const hardwareTables = await collectHardwareTables(session, options.beforeRequest);
       const hardware = parseHardwareVarbinds([...varbinds, ...hardwareTables.varbinds]);
       data.hardware = hardware;
+      if (options.discoverInterfaces) {
+        const interfaceDiscovery = await discoverSnmpInterfaces(session, options.beforeRequest);
+        data.interfaces = interfaceDiscovery.interfaces;
+        if (interfaceDiscovery.errors.length > 0) {
+          data.interfaceDiscoveryErrors = interfaceDiscovery.errors.map(classifySnmpError);
+        }
+      }
       const tableMetrics = [
         {
           metricId: 'cpu_utilization',
@@ -573,7 +599,10 @@ async function testDeviceTelemetry(device) {
   try {
     let snmpData;
     try {
-      snmpData = await collectSnmp(device, { beforeRequest: () => diagnosticRateLimiter.acquire() });
+      snmpData = await collectSnmp(device, {
+        beforeRequest: () => diagnosticRateLimiter.acquire(),
+        discoverInterfaces: true,
+      });
     } catch (error) {
       const errorCode = classifySnmpError(error);
       return {
@@ -589,8 +618,12 @@ async function testDeviceTelemetry(device) {
     return {
       deviceId: key,
       snmpVersion: device.snmpVersion || '2c',
-      status: snmpData.responded ? 'AVAILABLE' : (snmpData.errorCode || 'UNAVAILABLE'),
-      reason: snmpData.reason || null,
+      status: snmpData.identityVerified
+        ? 'AVAILABLE'
+        : snmpData.errorCode || (snmpData.responded ? 'IDENTITY_UNAVAILABLE' : 'UNAVAILABLE'),
+      reason: snmpData.responded && !snmpData.identityVerified
+        ? 'SNMP responded but sysDescr.0 and sysName.0 were not returned'
+        : snmpData.reason || null,
       collectedAt: new Date(),
       collectionDurationMs: Date.now() - startedAt,
       snmp: snmpData,
@@ -640,9 +673,13 @@ async function resolveAlert(device, type) {
 async function saveUnavailable(device, reason, collectionStatus = 'blocked') {
   const stateChanged = device.status !== 'UNKNOWN'
     || device.consecutiveFailureCount !== 0
-    || device.consecutiveRecoveryCount !== 0;
+    || device.consecutiveRecoveryCount !== 0
+    || (device.healthStatus != null && device.healthStatus !== 'Unknown')
+    || device.healthScore != null;
   if (stateChanged) {
     device.status = 'UNKNOWN';
+    device.healthStatus = 'Unknown';
+    device.healthScore = null;
     device.consecutiveFailureCount = 0;
     device.consecutiveRecoveryCount = 0;
     await device.save();
@@ -1029,7 +1066,17 @@ async function processDevice(
       },
     },
     telemetryChecks: snmpData?.oidChecks || [],
-    health: healthResult,
+    health: {
+      overallScore: healthResult.overallScore,
+      coveragePercent: healthResult.coveragePercent,
+      healthStatus: healthResult.healthStatus,
+      availabilityScore: healthResult.components.availability,
+      performanceScore: healthResult.components.performance,
+      trafficScore: healthResult.components.traffic,
+      hardwareScore: healthResult.components.hardware,
+      breakdown: healthResult.breakdown,
+      explanation: healthResult.explanation,
+    },
     reachability: {
       confirmedMethod: snmpData?.responded ? 'snmp' : (reachable ? 'icmp' : 'none'),
       isReachable: Boolean(reachable),
@@ -1194,23 +1241,14 @@ function startMonitoring() {
       }
 
       const now = Date.now();
-      const [activeCollectors, approvedSubnets, networkPolicySetting] = await Promise.all([
-        Collector.find({ status: 'active' }).select('subnet').lean(),
+      const [approvedSubnets, networkPolicySetting] = await Promise.all([
         Subnet.find({ status: 'active', approvalStatus: 'approved' }).lean(),
         Setting.findOne({ key: 'NETWORK_AUTHORIZATION_POLICY' }),
       ]);
-      const monitoringSubnetIds = new Set(
-        approvedSubnets
-          .filter((subnet) => subnet.monitoringEnabled)
-          .map((subnet) => String(subnet._id)),
-      );
-      const activeCollectorSubnets = activeCollectors
-        .map((collector) => collector.subnet)
-        .filter((subnetId) => monitoringSubnetIds.has(String(subnetId)));
       const devices = await Device.find({
         monitoringStatus: true,
+        enrollmentStatus: 'approved',
         collectorId: null,
-        subnet: { $nin: activeCollectorSubnets },
       }).select('+snmpCommunity +snmpAuthKey +snmpPrivKey');
       const networkAuthorizationPolicy = getNetworkAuthorizationPolicy(networkPolicySetting?.value);
       const monitoringAllowlist = parseAllowlist(process.env.MONITORING_TARGET_ALLOWLIST);

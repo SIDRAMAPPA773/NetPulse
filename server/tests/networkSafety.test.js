@@ -37,7 +37,7 @@ test('approved private subnet registry authorizes member IPs in explicit migrati
   assert.equal(getApprovedSubnetDiscoveryHosts({ ...subnet, status: 'disabled' }, [], 'subnet_registry').error, 'SUBNET_NOT_APPROVED');
   assert.equal(getApprovedSubnetDiscoveryHosts({ ...subnet, cidr: '127.0.0.0/8' }, [], 'subnet_registry').error, 'UNSAFE_CIDR');
   assert.equal(getDiscoveryAuthorizationMode(undefined), 'dual');
-  assert.equal(getEffectiveDiscoveryAuthorizationMode(undefined, 'subnet_registry'), 'subnet_registry');
+  assert.equal(getEffectiveDiscoveryAuthorizationMode(undefined, 'dual'), 'subnet_registry');
   assert.equal(getEffectiveDiscoveryAuthorizationMode({ mode: 'legacy_allowlists' }, 'subnet_registry'), 'dual');
   assert.equal(getEffectiveDiscoveryAuthorizationMode({ mode: 'application_managed' }, 'dual'), 'subnet_registry');
 });

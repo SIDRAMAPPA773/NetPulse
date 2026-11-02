@@ -2,29 +2,34 @@ function clamp(min, max, val) {
   return Math.min(max, Math.max(min, val));
 }
 
+const MINIMUM_HEALTH_SCORE_COVERAGE_PERCENT = 70;
+
 function calculateAvailabilityScore(deviceStatus, availabilityPercent) {
-  if (deviceStatus === 'DOWN') {
-    return { score: 0, reason: 'Device is offline and failing reachability probes' };
-  }
-  if (deviceStatus === 'UNKNOWN') {
-    return { score: null, reason: 'Device reachability has not been verified' };
-  }
   if (Number.isFinite(availabilityPercent)) {
     const score = clamp(0, 100, Math.round(availabilityPercent));
-    return { score, reason: `Probe window availability is ${score}%` };
+    return { score, coveragePercent: 100, reason: `Probe window availability is ${score}%` };
   }
-  if (deviceStatus === 'UP' || deviceStatus === 'WARNING') {
-    return { score: 100, reason: 'Device is reachable' };
+  if (deviceStatus === 'UNKNOWN') {
+    return { score: null, coveragePercent: 0, reason: 'Device reachability has not been verified by a monitoring sample' };
   }
-  return { score: null, reason: 'No availability sample available' };
+  return {
+    score: null,
+    coveragePercent: 0,
+    reason: deviceStatus === 'DOWN'
+      ? 'Device is marked down, but no current availability sample is available'
+      : 'No availability sample available; inventory status is not a monitoring sample',
+  };
 }
 
 function calculatePerformanceScore(latency, packetLoss, jitter) {
   const hasLatency = Number.isFinite(latency) && latency >= 0;
   const hasLoss = Number.isFinite(packetLoss) && packetLoss >= 0;
 
-  if (!hasLatency && !hasLoss) {
-    return { score: null, reason: 'No ICMP latency or packet-loss measurements available' };
+  const latencyWeight = hasLatency ? 0.55 : 0;
+  const lossWeight = hasLoss ? 0.45 : 0;
+  const activeWeight = latencyWeight + lossWeight;
+  if (activeWeight === 0) {
+    return { score: null, coveragePercent: 0, reason: 'No ICMP latency or packet-loss measurements available' };
   }
 
   let latencyComponent = 100;
@@ -46,23 +51,39 @@ function calculatePerformanceScore(latency, packetLoss, jitter) {
     jitterPenalty = clamp(0, 20, Math.round((jitter - 10) * 0.5));
   }
 
-  const score = clamp(0, 100, Math.round(0.55 * latencyComponent + 0.45 * lossComponent - jitterPenalty));
+  const measuredScore = (
+    (hasLatency ? 0.55 * latencyComponent : 0)
+    + (hasLoss ? 0.45 * lossComponent : 0)
+  ) / activeWeight;
+  const coveragePercent = Math.round(activeWeight * 100);
+  const score = clamp(0, 100, Math.round(measuredScore - jitterPenalty));
   const explanation = [];
   if (hasLatency) explanation.push(`RTT: ${latency}ms`);
   if (hasLoss) explanation.push(`Loss: ${packetLoss}%`);
   if (Number.isFinite(jitter)) explanation.push(`Jitter: ${jitter}ms`);
 
-  return { score, reason: explanation.join(' · ') };
+  return { score, coveragePercent, reason: explanation.join(' · ') };
 }
 
 function calculateTrafficScore(inBps, outBps, speedBps, inErrors, outErrors, inDiscards, outDiscards) {
   const hasThroughput = Number.isFinite(inBps) || Number.isFinite(outBps);
   const hasSpeed = Number.isFinite(speedBps) && speedBps > 0;
-  const hasErrors = Number.isFinite(inErrors) || Number.isFinite(outErrors);
-  const hasDrops = Number.isFinite(inDiscards) || Number.isFinite(outDiscards);
+  const hasInErrors = Number.isFinite(inErrors);
+  const hasOutErrors = Number.isFinite(outErrors);
+  const hasInDiscards = Number.isFinite(inDiscards);
+  const hasOutDiscards = Number.isFinite(outDiscards);
+  const hasErrors = hasInErrors || hasOutErrors;
+  const hasDrops = hasInDiscards || hasOutDiscards;
+  const coveragePercent = (Number.isFinite(inBps) ? 20 : 0)
+    + (Number.isFinite(outBps) ? 20 : 0)
+    + (hasSpeed ? 20 : 0)
+    + (hasInErrors ? 10 : 0)
+    + (hasOutErrors ? 10 : 0)
+    + (hasInDiscards ? 10 : 0)
+    + (hasOutDiscards ? 10 : 0);
 
   if (!hasThroughput && !hasErrors && !hasDrops) {
-    return { score: null, reason: 'Interface telemetry or SNMP IF-MIB is not configured' };
+    return { score: null, coveragePercent: 0, reason: 'Interface telemetry or SNMP IF-MIB is not configured' };
   }
 
   let score = 100;
@@ -100,6 +121,7 @@ function calculateTrafficScore(inBps, outBps, speedBps, inErrors, outErrors, inD
 
   return {
     score: clamp(0, 100, score),
+    coveragePercent,
     reason: reasons.join(' · ') || 'Interface metrics are healthy',
   };
 }
@@ -108,9 +130,10 @@ function calculateHardwareScore(cpuUtilization, memoryUtilization, temperatureCe
   const hasCpu = Number.isFinite(cpuUtilization) && cpuUtilization >= 0;
   const hasMem = Number.isFinite(memoryUtilization) && memoryUtilization >= 0;
   const hasTemp = Number.isFinite(temperatureCelsius);
+  const coveragePercent = Math.round(((hasCpu ? 1 : 0) + (hasMem ? 1 : 0) + (hasTemp ? 1 : 0)) / 3 * 100);
 
   if (!hasCpu && !hasMem && !hasTemp) {
-    return { score: null, reason: 'Hardware sensors (CPU, RAM, Temp) not supported or configured via SNMP' };
+    return { score: null, coveragePercent: 0, reason: 'Hardware sensors (CPU, RAM, Temp) not supported or configured via SNMP' };
   }
 
   let totalScore = 0;
@@ -152,6 +175,7 @@ function calculateHardwareScore(cpuUtilization, memoryUtilization, temperatureCe
   const score = count > 0 ? clamp(0, 100, Math.round(totalScore / count)) : null;
   return {
     score,
+    coveragePercent,
     reason: reasons.join(' · ') || 'Hardware operating normally',
   };
 }
@@ -178,22 +202,37 @@ function calculateOverallHealthScore({
   const performance = calculatePerformanceScore(latency, packetLoss, jitter);
   const traffic = calculateTrafficScore(inBps, outBps, speedBps, inErrors, outErrors, inDiscards, outDiscards);
   const hardware = calculateHardwareScore(cpuUtilization, memoryUtilization, temperatureCelsius, temperatureThreshold);
+  const baseWeights = {
+    availability: 0.35,
+    performance: 0.35,
+    traffic: 0.15,
+    hardware: 0.15,
+  };
+  const activeWeights = {
+    availability: baseWeights.availability * availability.coveragePercent / 100,
+    performance: baseWeights.performance * performance.coveragePercent / 100,
+    traffic: baseWeights.traffic * traffic.coveragePercent / 100,
+    hardware: baseWeights.hardware * hardware.coveragePercent / 100,
+  };
+  const activeWeightSum = Object.values(activeWeights).reduce((sum, weight) => sum + weight, 0);
+  const coveragePercent = Math.round(activeWeightSum * 100);
 
-  if (deviceStatus === 'DOWN') {
+  if (deviceStatus === 'DOWN' && availability.score !== null) {
     return {
       overallScore: 0,
+      coveragePercent,
       healthStatus: 'Critical',
       components: {
         availability: availability.score,
-        performance: 0,
+        performance: performance.score,
         traffic: traffic.score,
         hardware: hardware.score,
       },
       breakdown: [
-        { name: 'Availability', score: 0, status: 'Critical', reason: availability.reason },
-        { name: 'Network Performance', score: 0, status: 'Critical', reason: 'Device is offline' },
-        { name: 'Traffic Health', score: traffic.score, status: traffic.score === null ? 'Excluded' : 'Evaluated', reason: traffic.reason },
-        { name: 'Hardware Health', score: hardware.score, status: hardware.score === null ? 'Excluded' : 'Evaluated', reason: hardware.reason },
+        { name: 'Availability', score: 0, coveragePercent: availability.coveragePercent, status: 'Critical', reason: availability.reason },
+        { name: 'Network Performance', score: performance.score, coveragePercent: performance.coveragePercent, status: performance.score === null ? 'Excluded' : (performance.score >= 80 ? 'Healthy' : performance.score >= 60 ? 'Warning' : 'Critical'), reason: performance.score === null ? 'No ICMP performance sample is available' : performance.reason },
+        { name: 'Traffic Health', score: traffic.score, coveragePercent: traffic.coveragePercent, status: traffic.score === null ? 'Excluded' : 'Evaluated', reason: traffic.reason },
+        { name: 'Hardware Health', score: hardware.score, coveragePercent: hardware.coveragePercent, status: hardware.score === null ? 'Excluded' : 'Evaluated', reason: hardware.reason },
       ],
       explanation: 'Device is offline and failing reachability probes',
     };
@@ -202,40 +241,29 @@ function calculateOverallHealthScore({
   if (deviceStatus === 'UNKNOWN' && availability.score === null && performance.score === null) {
     return {
       overallScore: null,
+      coveragePercent,
       healthStatus: 'Unknown',
       components: {
         availability: null,
         performance: null,
-        traffic: null,
-        hardware: null,
+        traffic: traffic.score,
+        hardware: hardware.score,
       },
       breakdown: [
-        { name: 'Availability', score: null, status: 'Unknown', reason: availability.reason },
-        { name: 'Network Performance', score: null, status: 'Unknown', reason: performance.reason },
-        { name: 'Traffic Health', score: null, status: 'Excluded', reason: traffic.reason },
-        { name: 'Hardware Health', score: null, status: 'Excluded', reason: hardware.reason },
+        { name: 'Availability', score: null, coveragePercent: availability.coveragePercent, status: 'Unknown', reason: availability.reason },
+        { name: 'Network Performance', score: null, coveragePercent: performance.coveragePercent, status: 'Unknown', reason: performance.reason },
+        { name: 'Traffic Health', score: traffic.score, coveragePercent: traffic.coveragePercent, status: traffic.score === null ? 'Excluded' : 'Evaluated', reason: traffic.reason },
+        { name: 'Hardware Health', score: hardware.score, coveragePercent: hardware.coveragePercent, status: hardware.score === null ? 'Excluded' : 'Evaluated', reason: hardware.reason },
       ],
-      explanation: 'Device state is unknown; no telemetry has been confirmed',
+      explanation: 'Reachability and network performance are unverified; overall health remains unknown',
     };
   }
 
   // Dynamic weight normalization for available components
-  const baseWeights = {
-    availability: 0.35,
-    performance: 0.35,
-    traffic: 0.15,
-    hardware: 0.15,
-  };
-
-  let activeWeightSum = 0;
-  if (availability.score !== null) activeWeightSum += baseWeights.availability;
-  if (performance.score !== null) activeWeightSum += baseWeights.performance;
-  if (traffic.score !== null) activeWeightSum += baseWeights.traffic;
-  if (hardware.score !== null) activeWeightSum += baseWeights.hardware;
-
   if (activeWeightSum === 0) {
     return {
       overallScore: null,
+      coveragePercent: 0,
       healthStatus: 'Unknown',
       components: { availability: null, performance: null, traffic: null, hardware: null },
       breakdown: [],
@@ -244,39 +272,45 @@ function calculateOverallHealthScore({
   }
 
   let weightedScore = 0;
-  if (availability.score !== null) weightedScore += availability.score * (baseWeights.availability / activeWeightSum);
-  if (performance.score !== null) weightedScore += performance.score * (baseWeights.performance / activeWeightSum);
-  if (traffic.score !== null) weightedScore += traffic.score * (baseWeights.traffic / activeWeightSum);
-  if (hardware.score !== null) weightedScore += hardware.score * (baseWeights.hardware / activeWeightSum);
+  if (availability.score !== null) weightedScore += availability.score * (activeWeights.availability / activeWeightSum);
+  if (performance.score !== null) weightedScore += performance.score * (activeWeights.performance / activeWeightSum);
+  if (traffic.score !== null) weightedScore += traffic.score * (activeWeights.traffic / activeWeightSum);
+  if (hardware.score !== null) weightedScore += hardware.score * (activeWeights.hardware / activeWeightSum);
 
-  const overallScore = clamp(0, 100, Math.round(weightedScore));
+  const overallScore = coveragePercent < MINIMUM_HEALTH_SCORE_COVERAGE_PERCENT
+    ? null
+    : clamp(0, 100, Math.min(Math.round(weightedScore), coveragePercent));
 
-  let healthStatus = 'Healthy';
-  if (overallScore < 60) healthStatus = 'Critical';
-  else if (overallScore < 80) healthStatus = 'Warning';
+  let healthStatus = overallScore === null ? 'Unknown' : 'Healthy';
+  if (overallScore !== null && overallScore < 60) healthStatus = 'Critical';
+  else if (overallScore !== null && overallScore < 80) healthStatus = 'Warning';
 
   const breakdown = [
     {
       name: 'Availability',
       score: availability.score,
+      coveragePercent: availability.coveragePercent,
       status: availability.score === null ? 'Excluded' : (availability.score >= 80 ? 'Healthy' : availability.score >= 60 ? 'Warning' : 'Critical'),
       reason: availability.reason,
     },
     {
       name: 'Network Performance',
       score: performance.score,
+      coveragePercent: performance.coveragePercent,
       status: performance.score === null ? 'Excluded' : (performance.score >= 80 ? 'Healthy' : performance.score >= 60 ? 'Warning' : 'Critical'),
       reason: performance.reason,
     },
     {
       name: 'Traffic Health',
       score: traffic.score,
+      coveragePercent: traffic.coveragePercent,
       status: traffic.score === null ? 'Excluded' : (traffic.score >= 80 ? 'Healthy' : traffic.score >= 60 ? 'Warning' : 'Critical'),
       reason: traffic.reason,
     },
     {
       name: 'Hardware Health',
       score: hardware.score,
+      coveragePercent: hardware.coveragePercent,
       status: hardware.score === null ? 'Excluded' : (hardware.score >= 80 ? 'Healthy' : hardware.score >= 60 ? 'Warning' : 'Critical'),
       reason: hardware.reason,
     },
@@ -284,6 +318,7 @@ function calculateOverallHealthScore({
 
   return {
     overallScore,
+    coveragePercent,
     healthStatus,
     components: {
       availability: availability.score,
@@ -292,7 +327,9 @@ function calculateOverallHealthScore({
       hardware: hardware.score,
     },
     breakdown,
-    explanation: `Overall health score calculated from ${breakdown.filter((b) => b.score !== null).length} active metric components`,
+    explanation: overallScore === null
+      ? `Overall health remains Unknown: only ${coveragePercent}% evidence coverage is available; at least ${MINIMUM_HEALTH_SCORE_COVERAGE_PERCENT}% is required`
+      : `Score is based on ${breakdown.filter((b) => b.score !== null).length} of 4 metric components (${coveragePercent}% evidence coverage)`,
   };
 }
 

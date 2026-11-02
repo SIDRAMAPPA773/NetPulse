@@ -10,9 +10,9 @@ const Settings = () => {
   const [settings, setSettings] = useState({
     SIMULATION_MODE: true,
     EMERGENCY_STOP: false,
-    DISCOVERY_AUTHORIZATION_MODE: 'dual',
+    DISCOVERY_AUTHORIZATION_MODE: 'subnet_registry',
     NETWORK_AUTHORIZATION_POLICY: {
-      mode: 'legacy_allowlists',
+      mode: 'application_managed',
       autoAuthorizeInterfaces: false,
       interfaceTypes: [],
       maxHosts: 256
@@ -44,13 +44,13 @@ const Settings = () => {
         ...res.data,
         SIMULATION_MODE: Boolean(res.data.SIMULATION_MODE === true || res.data.SIMULATION_MODE === 'true'),
         EMERGENCY_STOP: Boolean(res.data.EMERGENCY_STOP === true || res.data.EMERGENCY_STOP === 'true'),
-        DISCOVERY_AUTHORIZATION_MODE: res.data.DISCOVERY_AUTHORIZATION_MODE === 'subnet_registry'
-          ? 'subnet_registry'
-          : 'dual',
+        DISCOVERY_AUTHORIZATION_MODE: res.data.DISCOVERY_AUTHORIZATION_MODE === 'dual'
+          ? 'dual'
+          : 'subnet_registry',
         NETWORK_AUTHORIZATION_POLICY: {
-          mode: res.data.NETWORK_AUTHORIZATION_POLICY?.mode === 'application_managed'
-            ? 'application_managed'
-            : 'legacy_allowlists',
+          mode: res.data.NETWORK_AUTHORIZATION_POLICY?.mode === 'legacy_allowlists'
+            ? 'legacy_allowlists'
+            : 'application_managed',
           autoAuthorizeInterfaces: res.data.NETWORK_AUTHORIZATION_POLICY?.autoAuthorizeInterfaces === true,
           interfaceTypes: Array.isArray(res.data.NETWORK_AUTHORIZATION_POLICY?.interfaceTypes)
             ? res.data.NETWORK_AUTHORIZATION_POLICY.interfaceTypes
@@ -121,9 +121,9 @@ const Settings = () => {
     setSettings({
       SIMULATION_MODE: true,
       EMERGENCY_STOP: false,
-      DISCOVERY_AUTHORIZATION_MODE: 'dual',
+      DISCOVERY_AUTHORIZATION_MODE: 'subnet_registry',
       NETWORK_AUTHORIZATION_POLICY: {
-        mode: 'legacy_allowlists',
+        mode: 'application_managed',
         autoAuthorizeInterfaces: false,
         interfaceTypes: [],
         maxHosts: 256
@@ -262,7 +262,7 @@ const Settings = () => {
             </p>
             {!networkPolicyConfigured && (
               <p className="mt-2 text-xs text-amber-800">
-                The unified policy has not been saved yet. Existing discovery authorization settings remain in effect until an administrator selects and saves a mode.
+                Application-managed authorization is active by default. Choose legacy allowlists to require explicit environment entries.
               </p>
             )}
           </div>

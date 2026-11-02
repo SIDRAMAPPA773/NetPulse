@@ -132,7 +132,17 @@ const getSubnet = async (req, res) => {
 
 const createSubnet = async (req, res) => {
   try {
-    const { name, cidr, description, location, department, allowOverlap, overlapPermissionReason } = req.body || {};
+    const {
+      name,
+      cidr,
+      description,
+      location,
+      department,
+      autoEnroll,
+      requireEnrollmentApproval,
+      allowOverlap,
+      overlapPermissionReason,
+    } = req.body || {};
     if (name === undefined) return res.status(400).json({ message: 'Name is required' });
     for (const [value, label, max, required] of [
       [name, 'Name', 120, true],
@@ -143,6 +153,14 @@ const createSubnet = async (req, res) => {
     ]) {
       const error = validateText(value, label, max, required);
       if (error) return res.status(400).json({ message: error });
+    }
+    for (const [value, label] of [
+      [autoEnroll, 'autoEnroll'],
+      [requireEnrollmentApproval, 'requireEnrollmentApproval'],
+    ]) {
+      if (value !== undefined && typeof value !== 'boolean') {
+        return res.status(400).json({ message: `${label} must be a boolean` });
+      }
     }
     const calculated = calculateSubnet(cidr);
     if (calculated.error) return res.status(400).json({ message: calculated.error });
@@ -174,8 +192,8 @@ const createSubnet = async (req, res) => {
       overlapPermitted: Boolean(overlap),
       overlapPermissionReason: overlap ? overlapPermissionReason.trim() : '',
       overlapPermittedBy: overlap ? req.user._id : null,
-      autoEnroll: false,
-      requireEnrollmentApproval: true,
+      autoEnroll: autoEnroll === true,
+      requireEnrollmentApproval: requireEnrollmentApproval !== false,
       monitoringEnabled: false,
       discoveryScheduleEnabled: false,
     });

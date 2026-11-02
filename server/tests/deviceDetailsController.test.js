@@ -19,8 +19,9 @@ test('device details include the latest collection and successful sample metadat
   };
   const latestSuccessfulMeasurement = {
     createdAt: new Date('2026-10-29T17:26:30.000Z'),
-    measurementSource: 'simulated',
+    measurementSource: 'real',
   };
+  const metricFilters = [];
 
   t.after(() => {
     Device.findById = originalFindById;
@@ -33,7 +34,9 @@ test('device details include the latest collection and successful sample metadat
     select: async () => device,
   });
   Setting.findOne = async () => null;
+  Subnet.find = () => ({ lean: async () => [] });
   Metric.findOne = (filter) => {
+    metricFilters.push(filter);
     const query = {
       sort: () => query,
       select: () => query,
@@ -41,7 +44,6 @@ test('device details include the latest collection and successful sample metadat
         ? latestSuccessfulMeasurement
         : latestCollection),
     };
-    Subnet.find = () => ({ lean: async () => [] });
     return query;
   };
 
@@ -57,4 +59,5 @@ test('device details include the latest collection and successful sample metadat
   assert.equal(responseBody.latestCollection, latestCollection);
   assert.equal(responseBody.latestSuccessfulMeasurement, latestSuccessfulMeasurement);
   assert.equal('snmpCommunity' in responseBody, false);
+  assert.equal(metricFilters[1]['reachability.isReachable'], true);
 });

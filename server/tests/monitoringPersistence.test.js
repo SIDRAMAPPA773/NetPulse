@@ -113,6 +113,10 @@ test('real authorized ICMP results are persisted with measured values and timest
   assert.equal(saved.availability, 100);
   assert.equal(saved.jitter, 7);
   assert.equal(saved.sampleCount, 2);
+  assert.equal(saved.health.availabilityScore, 100);
+  assert.equal(saved.health.performanceScore, 95);
+  assert.equal(saved.health.coveragePercent, 70);
+  assert.equal(saved.health.overallScore, 70);
   assert.equal(saved.raw.probes.length, 2);
   assert.ok(saved.observationWindowStart instanceof Date);
   assert.ok(saved.observationWindowEnd instanceof Date);
