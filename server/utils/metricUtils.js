@@ -53,17 +53,32 @@ function computePPS(deltaPackets, elapsedSeconds) {
 }
 
 function computeCounterDelta(previous, current, elapsedSeconds, widthBits = 64) {
-  if (!Number.isFinite(previous) || !Number.isFinite(current) || previous < 0 || current < 0 ||
-      !Number.isFinite(elapsedSeconds) || elapsedSeconds <= 0 ||
+  if (!Number.isFinite(elapsedSeconds) || elapsedSeconds <= 0 ||
       !Number.isInteger(widthBits) || widthBits < 1 || widthBits > 64) {
     return null;
   }
-  if (current >= previous) return current - previous;
 
-  const modulus = 2 ** widthBits;
-  if (previous >= modulus * 0.9 && current <= modulus * 0.1) {
-    return (modulus - previous) + current;
+  const isExactCounter = (value) => (
+    typeof value === 'bigint'
+    || (typeof value === 'string' && /^\d+$/.test(value))
+    || (Number.isSafeInteger(value) && value >= 0)
+  );
+  if (isExactCounter(previous) && isExactCounter(current)) {
+    const previousValue = BigInt(previous);
+    const currentValue = BigInt(current);
+    if (currentValue >= previousValue) return Number(currentValue - previousValue);
+
+    const modulus = 1n << BigInt(widthBits);
+    if (previousValue >= (modulus * 9n) / 10n && currentValue <= modulus / 10n) {
+      return Number((modulus - previousValue) + currentValue);
+    }
+    return null;
   }
+
+  if (!Number.isFinite(previous) || !Number.isFinite(current) || previous < 0 || current < 0) return null;
+  if (current >= previous) return current - previous;
+  const modulus = 2 ** widthBits;
+  if (previous >= modulus * 0.9 && current <= modulus * 0.1) return (modulus - previous) + current;
   return null;
 }
 

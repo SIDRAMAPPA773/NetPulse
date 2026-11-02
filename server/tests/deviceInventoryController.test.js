@@ -3,12 +3,16 @@ const assert = require('node:assert/strict');
 const Device = require('../models/Device');
 const Metric = require('../models/Metric');
 const Alert = require('../models/Alert');
+const Subnet = require('../models/Subnet');
+const Setting = require('../models/Setting');
 const { getDevices } = require('../controllers/deviceController');
 
 test('device inventory includes enabled devices with no recent measurements', async (t) => {
   const originalDeviceFind = Device.find;
   const originalMetricAggregate = Metric.aggregate;
   const originalAlertAggregate = Alert.aggregate;
+  const originalSubnetFind = Subnet.find;
+  const originalSettingFindOne = Setting.findOne;
   const device = {
     _id: 'device-id',
     ipAddress: '10.38.27.142',
@@ -23,6 +27,8 @@ test('device inventory includes enabled devices with no recent measurements', as
     Device.find = originalDeviceFind;
     Metric.aggregate = originalMetricAggregate;
     Alert.aggregate = originalAlertAggregate;
+    Subnet.find = originalSubnetFind;
+    Setting.findOne = originalSettingFindOne;
   });
 
   const query = {
@@ -31,6 +37,8 @@ test('device inventory includes enabled devices with no recent measurements', as
     limit: async () => [device],
   };
   Device.find = () => query;
+  Subnet.find = () => ({ lean: async () => [] });
+  Setting.findOne = async () => null;
   Metric.aggregate = async () => [];
   Alert.aggregate = async () => [];
 
@@ -51,6 +59,8 @@ test('device inventory separates an authorization-blocked collection from the la
   const originalDeviceFind = Device.find;
   const originalMetricAggregate = Metric.aggregate;
   const originalAlertAggregate = Alert.aggregate;
+  const originalSubnetFind = Subnet.find;
+  const originalSettingFindOne = Setting.findOne;
   const successfulMeasurement = {
     createdAt: new Date('2025-01-01T00:00:00.000Z'),
     measurementSource: 'simulated',
@@ -70,6 +80,8 @@ test('device inventory separates an authorization-blocked collection from the la
     Device.find = originalDeviceFind;
     Metric.aggregate = originalMetricAggregate;
     Alert.aggregate = originalAlertAggregate;
+    Subnet.find = originalSubnetFind;
+    Setting.findOne = originalSettingFindOne;
   });
 
   const query = {
@@ -78,6 +90,8 @@ test('device inventory separates an authorization-blocked collection from the la
     limit: async () => [device],
   };
   Device.find = () => query;
+  Subnet.find = () => ({ lean: async () => [] });
+  Setting.findOne = async () => null;
   Metric.aggregate = async (pipeline) => {
     const match = pipeline.find((stage) => stage.$match);
     if (match.$match.availabilityStatus === 'available') {

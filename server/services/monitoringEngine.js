@@ -1,6 +1,7 @@
 const cron = require('node-cron');
 const snmp = require('net-snmp');
 const Device = require('../models/Device');
+const Subnet = require('../models/Subnet');
 const Metric = require('../models/Metric');
 const Alert = require('../models/Alert');
 const Setting = require('../models/Setting');
@@ -18,11 +19,31 @@ const {
   readWindowsInterfaceCounters,
 } = require('../utils/windowsInterfaceCounters');
 const {
-  isTargetAllowed,
   parseAllowlist,
+  getApprovedSubnetDiscoveryHosts,
   setEmergencyStop,
   isEmergencyStopActive,
 } = require('../utils/networkSafety');
+const {
+  HARDWARE_OIDS,
+  createSnmpSession,
+  collectHardwareTables,
+  parseHardwareVarbinds,
+} = require('../utils/snmpHardwareCollectors');
+const { calculateOverallHealthScore } = require('../utils/healthScoreEngine');
+const { authorizeMonitoringDevice } = require('../utils/subnetAuthorization');
+const { runDiscoveryForSubnet } = require('./discoveryService');
+const { synchronizeConnectedInterfaces, isFreshInterfaceAuthorization } = require('./interfaceAuthorizationService');
+const {
+  getNetworkAuthorizationPolicy,
+  getEffectiveDiscoveryAuthorizationMode,
+} = require('../utils/networkAuthorizationPolicy');
+
+const telemetryTestTimes = new Map();
+const SNMP_TEST_COOLDOWN_MS = 60_000;
+let telemetryTestInProgress = false;
+let lastTelemetryTestStartedAt = 0;
+const diagnosticRateLimiter = createRateLimiter({ maxPerSecond: 1 });
 
 const POLL_INTERVAL_SECONDS = 10;
 const DEFAULT_CONCURRENCY = 5;
@@ -35,12 +56,22 @@ let simulationMode = true;
 let monitoringStarted = false;
 let cycleRunning = false;
 let monitoringTask = null;
+let discoveryTask = null;
+let interfaceAuthorizationTask = null;
 let currentCyclePromise = null;
+let scheduledDiscoveryRunning = false;
 let thresholds = {
   LATENCY_WARNING: 100,
   LATENCY_CRITICAL: 250,
   PACKET_LOSS_WARNING: 5,
   PACKET_LOSS_CRITICAL: 15,
+  CPU_WARNING: 80,
+  CPU_CRITICAL: 95,
+  MEMORY_WARNING: 85,
+  MEMORY_CRITICAL: 95,
+  INTERFACE_UTILIZATION_WARNING: 80,
+  INTERFACE_UTILIZATION_CRITICAL: 90,
+  HEALTH_CRITICAL: 50,
 };
 
 function isEnabled(value, fallback = false) {
@@ -71,17 +102,95 @@ function numericValue(value) {
   return Number.isFinite(number) ? number : null;
 }
 
-async function collectSnmp(device) {
+function exactCounterValue(value) {
+  if (typeof value === 'bigint') return value.toString();
+  if (Buffer.isBuffer(value) && value.length === 8) return value.readBigUInt64BE().toString();
+  if (typeof value === 'string' && /^\d+$/.test(value)) return value;
+  return Number.isSafeInteger(value) && value >= 0 ? String(value) : null;
+}
+
+function classifySnmpError(error) {
+  const message = String(error?.message || error || '').toLowerCase();
+  if (message.includes('timeout') || message.includes('timed out')) return 'TIMEOUT';
+  if (message.includes('auth') || message.includes('usm')) return 'AUTHENTICATION_FAILED';
+  if (message.includes('nosuchname') || message.includes('no such name')) return 'UNSUPPORTED';
+  return 'COLLECTION_ERROR';
+}
+
+function metricIdForOid(oid) {
+  if (oid === HARDWARE_OIDS.sysUpTime) return 'device_uptime';
+  if (oid.startsWith('1.3.6.1.4.1.2021.11.') || oid.startsWith('1.3.6.1.4.1.9.9.109.')) return 'cpu_utilization';
+  if (oid.startsWith('1.3.6.1.4.1.2021.4.')) return 'memory_utilization';
+  if (oid.startsWith('1.3.6.1.4.1.9.9.13.')) return 'temperature';
+
+  const ifMibColumn = oid.match(/^1\.3\.6\.1\.2\.1\.2\.2\.1\.(\d+)\.\d+$/)?.[1];
+  const highCapacityColumn = oid.match(/^1\.3\.6\.1\.2\.1\.31\.1\.1\.1\.(\d+)\.\d+$/)?.[1];
+  const column = highCapacityColumn || ifMibColumn;
+  const metricByColumn = {
+    5: 'interface_speed',
+    6: 'inbound_throughput',
+    7: 'inbound_packet_rate',
+    8: 'interface_operational_status',
+    10: highCapacityColumn ? 'outbound_throughput' : 'inbound_throughput',
+    11: highCapacityColumn ? 'outbound_packet_rate' : 'inbound_packet_rate',
+    13: 'inbound_dropped_packets',
+    14: 'inbound_interface_errors',
+    15: 'interface_speed',
+    16: 'outbound_throughput',
+    17: 'outbound_packet_rate',
+    19: 'outbound_dropped_packets',
+    20: 'outbound_interface_errors',
+  };
+  return metricByColumn[column] || 'interface_telemetry';
+}
+
+async function collectSnmp(device, options = {}) {
   if (device.snmpVersion === '3') {
-    return { supported: false, reason: 'SNMPv3 credentials are not configured by this application' };
-  }
-  if (!device.snmpCommunity) {
-    return { supported: false, reason: 'SNMP community is not configured' };
+    const level = device.snmpSecurityLevel || 'noAuthNoPriv';
+    if (!device.snmpSecurityName ||
+      (level !== 'noAuthNoPriv' && !device.snmpAuthKey) ||
+      (level === 'authPriv' && !device.snmpPrivKey)) {
+      return {
+        supported: false,
+        responded: false,
+        errorCode: 'NOT_CONFIGURED',
+        reason: 'SNMPv3 security name and required authentication/privacy keys are not configured',
+      };
+    }
+  } else if (!device.snmpCommunity) {
+    return {
+      supported: false,
+      responded: false,
+      errorCode: 'NOT_CONFIGURED',
+      reason: 'SNMP community is not configured',
+    };
   }
 
   const ifIndex = Number(device.snmpInterfaceIndex);
-  const oids = ['1.3.6.1.2.1.1.3.0'];
+  const oids = [
+    HARDWARE_OIDS.sysDescr,
+    HARDWARE_OIDS.sysUpTime,
+    HARDWARE_OIDS.sysName,
+  ];
+  if (device.snmpVersion !== '1') {
+    oids.push(
+      HARDWARE_OIDS.ucdCpuIdle,
+      HARDWARE_OIDS.ciscoCpu5Min,
+      HARDWARE_OIDS.ciscoCpuAvgBusy5,
+      HARDWARE_OIDS.ucdMemTotalReal,
+      HARDWARE_OIDS.ucdMemAvailReal,
+    );
+  }
   if (Number.isInteger(ifIndex) && ifIndex > 0) {
+    if (device.snmpVersion !== '1') {
+      oids.push(
+        `1.3.6.1.2.1.31.1.1.1.6.${ifIndex}`,
+        `1.3.6.1.2.1.31.1.1.1.10.${ifIndex}`,
+        `1.3.6.1.2.1.31.1.1.1.7.${ifIndex}`,
+        `1.3.6.1.2.1.31.1.1.1.11.${ifIndex}`,
+        `1.3.6.1.2.1.31.1.1.1.15.${ifIndex}`,
+      );
+    }
     oids.push(
       `1.3.6.1.2.1.2.2.1.10.${ifIndex}`,
       `1.3.6.1.2.1.2.2.1.16.${ifIndex}`,
@@ -97,60 +206,243 @@ async function collectSnmp(device) {
     );
   }
 
-  const version = device.snmpVersion === '1' ? snmp.Version1 : snmp.Version2c;
-  const session = snmp.createSession(device.ipAddress, device.snmpCommunity, {
-    version,
-    timeout: 1500,
-    retries: 0,
-  });
+  let session;
+  try {
+    session = createSnmpSession(device, { timeout: 1500, retries: 0 });
+  } catch (error) {
+    const errorCode = classifySnmpError(error);
+    return {
+      supported: true,
+      responded: false,
+      errorCode,
+      reason: 'Unable to initialize the configured SNMP session',
+      oidChecks: [{
+        oid: HARDWARE_OIDS.sysUpTime,
+        metricId: 'device_uptime',
+        snmpVersion: device.snmpVersion || '2c',
+        collectedAt: new Date(),
+        responseStatus: errorCode,
+        value: null,
+        unit: 'tim-ticks',
+        reason: 'Unable to initialize the configured SNMP session',
+        deviceId: String(device._id),
+        interfaceId: null,
+      }],
+    };
+  }
+  const deviceId = String(device._id);
 
+  await options.beforeRequest?.();
+  const collectedAt = new Date();
   const result = await new Promise((resolve) => {
     session.get(oids, (error, varbinds) => {
-      session.close();
       if (error) {
-        resolve({ supported: false, reason: 'SNMP request failed' });
+        session.close();
+        const errorCode = classifySnmpError(error);
+        const reason = errorCode === 'TIMEOUT'
+          ? 'SNMP agent did not respond before the request timeout'
+          : errorCode === 'AUTHENTICATION_FAILED'
+            ? 'SNMP authentication failed; verify the configured security credentials'
+            : 'SNMP collection failed';
+        resolve({
+          supported: true,
+          responded: errorCode === 'UNSUPPORTED',
+          errorCode,
+          reason: errorCode === 'UNSUPPORTED'
+            ? 'The SNMP agent responded, but one or more requested OIDs are unsupported'
+            : reason,
+          oidChecks: oids.map((oid) => ({
+            oid,
+            metricId: metricIdForOid(oid),
+            snmpVersion: device.snmpVersion || '2c',
+            collectedAt,
+            responseStatus: errorCode,
+            value: null,
+            unit: oid === '1.3.6.1.2.1.1.3.0' ? 'tim-ticks' : null,
+            reason: errorCode === 'UNSUPPORTED'
+              ? 'SNMPv1 request included an unsupported OID'
+              : reason,
+            deviceId,
+            interfaceId: Number.isInteger(ifIndex) && ifIndex > 0 ? String(ifIndex) : null,
+          })),
+        });
         return;
       }
 
+      const processResponse = async () => {
       const values = {};
       let interfaceName = null;
       let unsupported = false;
+      let highCapacityUnsupported = false;
+      const oidChecks = [];
       for (const varbind of varbinds) {
-        if (snmp.isVarbindError(varbind)) {
-          unsupported = true;
+        const isError = snmp.isVarbindError(varbind);
+        const oid = varbind.oid;
+        const isHighSpeed = oid === `1.3.6.1.2.1.31.1.1.1.15.${ifIndex}`;
+        const check = {
+          oid,
+          metricId: metricIdForOid(oid),
+          snmpVersion: device.snmpVersion || '2c',
+          collectedAt,
+          responseStatus: isError ? 'UNSUPPORTED' : 'AVAILABLE',
+          value: null,
+          unit: oid === '1.3.6.1.2.1.1.3.0'
+            ? 'tim-ticks'
+            : isHighSpeed
+              ? 'Mbit/s'
+              : oid.startsWith('1.3.6.1.4.1.2021.11.') || oid.startsWith('1.3.6.1.4.1.9.9.109.')
+                ? '%'
+                : oid.startsWith('1.3.6.1.4.1.2021.4.')
+                  ? 'kB'
+                  : oid.includes('.1.10.') || oid.includes('.1.16.')
+                ? 'octets'
+                : oid.includes('.1.14.') || oid.includes('.1.20.')
+                  ? 'errors'
+                  : oid.includes('.1.13.') || oid.includes('.1.19.')
+                    ? 'packets'
+                    : null,
+          reason: isError ? 'The device does not expose this OID for the configured interface' : null,
+          deviceId,
+          interfaceId: Number.isInteger(ifIndex) && ifIndex > 0 ? String(ifIndex) : null,
+        };
+        if (isError) {
+          oidChecks.push(check);
+          if (varbind.oid.startsWith('1.3.6.1.2.1.31.1.1.1.')) highCapacityUnsupported = true;
+          else unsupported = true;
           continue;
         }
         if (varbind.oid === `1.3.6.1.2.1.2.2.1.2.${ifIndex}`) {
           interfaceName = String(varbind.value);
         } else {
-          values[varbind.oid] = numericValue(varbind.value);
+          values[varbind.oid] = varbind.oid.startsWith('1.3.6.1.2.1.31.1.1.1.')
+            ? exactCounterValue(varbind.value)
+            : numericValue(varbind.value);
         }
+        check.value = values[varbind.oid] ?? String(varbind.value);
+        oidChecks.push(check);
       }
 
       const read = (suffix) => values[`1.3.6.1.2.1.2.2.1.${suffix}.${ifIndex}`] ?? null;
+      const readHighCapacity = (suffix) => values[`1.3.6.1.2.1.31.1.1.1.${suffix}.${ifIndex}`] ?? null;
+      const inOctetsHC = readHighCapacity(6);
+      const outOctetsHC = readHighCapacity(10);
+      const inPacketsHC = readHighCapacity(7);
+      const outPacketsHC = readHighCapacity(11);
+      const inOctets = inOctetsHC === null ? read(10) : Number(inOctetsHC);
+      const outOctets = outOctetsHC === null ? read(16) : Number(outOctetsHC);
       const data = {
         supported: true,
+        responded: true,
         sysUpTime: values['1.3.6.1.2.1.1.3.0'] ?? null,
         ifIndex: Number.isInteger(ifIndex) && ifIndex > 0 ? ifIndex : null,
         interfaceName,
-        inOctets: read(10),
-        outOctets: read(16),
-        inPackets: read(11),
-        outPackets: read(17),
+        inOctets,
+        outOctets,
+        inOctetsHC,
+        outOctetsHC,
+        inPackets: inPacketsHC === null ? read(11) : Number(inPacketsHC),
+        outPackets: outPacketsHC === null ? read(17) : Number(outPacketsHC),
+        inPacketsHC,
+        outPacketsHC,
         inErrors: read(14),
         outErrors: read(20),
         inDiscards: read(13),
         outDiscards: read(19),
-        interfaceSpeed: read(5),
+        interfaceSpeed: (read(5) > 0 ? read(5) : null)
+          ?? (readHighCapacity(15) > 0 ? readHighCapacity(15) * 1_000_000 : null),
+        interfaceHighSpeedMbps: readHighCapacity(15),
         operationalStatus: read(8),
-        countersSupported: Number.isInteger(ifIndex) && ifIndex > 0 && !unsupported,
+        countersSupported: Number.isInteger(ifIndex) && ifIndex > 0
+          && inOctets !== null && outOctets !== null && !unsupported,
+        highCapacitySupported: !highCapacityUnsupported
+          && (inOctetsHC !== null || outOctetsHC !== null),
+        oidChecks,
       };
       if (!data.ifIndex) data.reason = 'Configure an interface index to collect interface counters';
       else if (unsupported) data.reason = 'One or more requested interface counters are unsupported';
+      else if (highCapacityUnsupported) data.reason = 'High-capacity counters are unsupported; standard interface counters are used';
       else if (data.inOctets !== null && data.outOctets !== null) {
         data.reason = 'Waiting for a second SNMP interface-counter sample';
       }
-      resolve(data);
+      const hardwareTables = await collectHardwareTables(session, options.beforeRequest);
+      const hardware = parseHardwareVarbinds([...varbinds, ...hardwareTables.varbinds]);
+      data.hardware = hardware;
+      const tableMetrics = [
+        {
+          metricId: 'cpu_utilization',
+          oid: HARDWARE_OIDS.hrProcessorLoadTable,
+          value: hardware.cpu.source === 'host-resources-processor' ? hardware.cpu.utilization : null,
+          unit: '%',
+          available: hardware.cpu.source === 'host-resources-processor',
+          reason: hardware.cpu.reason,
+        },
+        {
+          metricId: 'cpu_utilization',
+          oid: HARDWARE_OIDS.ciscoCpu5MinTable,
+          value: hardware.cpu.source === 'cisco-cpm' ? hardware.cpu.utilization : null,
+          unit: '%',
+          available: hardware.cpu.source === 'cisco-cpm',
+          reason: hardware.cpu.reason,
+        },
+        {
+          metricId: 'memory_utilization',
+          oid: '1.3.6.1.2.1.25.2.3.1',
+          value: hardware.memory.utilization,
+          unit: '%',
+          available: hardware.memory.utilization !== null,
+          reason: hardware.memory.reason,
+        },
+        {
+          metricId: 'temperature',
+          oid: '1.3.6.1.4.1.9.9.13.1.3.1',
+          value: hardware.temperature.celsius,
+          unit: '°C',
+          available: hardware.temperature.celsius !== null,
+          reason: hardware.temperature.reason,
+        },
+      ];
+      for (const check of tableMetrics) {
+        const table = hardwareTables.checks.find((entry) => entry.oid === check.oid);
+        oidChecks.push({
+          metricId: check.metricId,
+          oid: check.oid,
+          snmpVersion: device.snmpVersion || '2c',
+          collectedAt,
+          responseStatus: check.available ? 'AVAILABLE' : table?.error
+            ? classifySnmpError(table.error)
+            : 'UNSUPPORTED',
+          value: check.value,
+          unit: check.unit,
+          reason: check.available ? null : check.reason,
+          deviceId,
+          interfaceId: null,
+        });
+      }
+      data.oidChecks = oidChecks;
+      session.close();
+      return data;
+      };
+      processResponse().then(resolve).catch((error) => {
+        session.close();
+        resolve({
+          supported: true,
+          responded: true,
+          errorCode: 'COLLECTION_ERROR',
+          reason: 'SNMP response processing failed',
+          oidChecks: [{
+            oid: '1.3.6.1.2.1.1.3.0',
+            metricId: 'device_uptime',
+            snmpVersion: device.snmpVersion || '2c',
+            collectedAt,
+            responseStatus: 'COLLECTION_ERROR',
+            value: null,
+            unit: 'tim-ticks',
+            reason: 'SNMP response processing failed',
+            deviceId,
+            interfaceId: null,
+          }],
+        });
+      });
     });
   });
 
@@ -163,10 +455,30 @@ async function collectSnmp(device) {
   const previous = snmpState.get(stateKey);
   if (previous) {
     const elapsedSeconds = (now - previous.timestamp) / 1000;
-    const inDelta = computeCounterDelta(previous.inOctets, result.inOctets, elapsedSeconds, 32);
-    const outDelta = computeCounterDelta(previous.outOctets, result.outOctets, elapsedSeconds, 32);
-    const inPacketDelta = computeCounterDelta(previous.inPackets, result.inPackets, elapsedSeconds, 32);
-    const outPacketDelta = computeCounterDelta(previous.outPackets, result.outPackets, elapsedSeconds, 32);
+    const previousInOctets = previous.inOctetsHC ?? previous.inOctets;
+    const previousOutOctets = previous.outOctetsHC ?? previous.outOctets;
+    const currentInOctets = result.inOctetsHC ?? result.inOctets;
+    const currentOutOctets = result.outOctetsHC ?? result.outOctets;
+    const inCounterWidth = result.inOctetsHC !== null ? 64 : 32;
+    const outCounterWidth = result.outOctetsHC !== null ? 64 : 32;
+    const inDelta = previous.inCounterWidth === inCounterWidth
+      ? computeCounterDelta(previousInOctets, currentInOctets, elapsedSeconds, inCounterWidth)
+      : null;
+    const outDelta = previous.outCounterWidth === outCounterWidth
+      ? computeCounterDelta(previousOutOctets, currentOutOctets, elapsedSeconds, outCounterWidth)
+      : null;
+    const inPacketDelta = computeCounterDelta(
+      previous.inPacketsHC ?? previous.inPackets,
+      result.inPacketsHC ?? result.inPackets,
+      elapsedSeconds,
+      result.inPacketsHC !== null ? 64 : 32,
+    );
+    const outPacketDelta = computeCounterDelta(
+      previous.outPacketsHC ?? previous.outPackets,
+      result.outPacketsHC ?? result.outPackets,
+      elapsedSeconds,
+      result.outPacketsHC !== null ? 64 : 32,
+    );
     result.elapsedSeconds = elapsedSeconds;
     result.inDelta = inDelta;
     result.outDelta = outDelta;
@@ -175,20 +487,106 @@ async function collectSnmp(device) {
     result.inPacketsPerSecond = inPacketDelta === null ? null : inPacketDelta / elapsedSeconds;
     result.outPacketsPerSecond = outPacketDelta === null ? null : outPacketDelta / elapsedSeconds;
     result.counterReset = (
-      result.inOctets < previous.inOctets && inDelta === null
+      inDelta === null && previousInOctets !== null && currentInOctets !== null
+      && BigInt(currentInOctets) < BigInt(previousInOctets)
     ) || (
-      result.outOctets < previous.outOctets && outDelta === null
+      outDelta === null && previousOutOctets !== null && currentOutOctets !== null
+      && BigInt(currentOutOctets) < BigInt(previousOutOctets)
     );
+    if (result.inBps !== null && result.outBps !== null) result.reason = null;
   }
 
   snmpState.set(stateKey, {
-    inOctets: result.inOctets,
-    outOctets: result.outOctets,
-    inPackets: result.inPackets,
-    outPackets: result.outPackets,
+    inOctets: result.inOctetsHC === null ? result.inOctets : null,
+    outOctets: result.outOctetsHC === null ? result.outOctets : null,
+    inOctetsHC: result.inOctetsHC,
+    outOctetsHC: result.outOctetsHC,
+    inPackets: result.inPacketsHC === null ? result.inPackets : null,
+    outPackets: result.outPacketsHC === null ? result.outPackets : null,
+    inPacketsHC: result.inPacketsHC,
+    outPacketsHC: result.outPacketsHC,
+    inCounterWidth: result.inOctetsHC !== null ? 64 : 32,
+    outCounterWidth: result.outOctetsHC !== null ? 64 : 32,
     timestamp: now,
   });
   return result;
+}
+
+async function testDeviceTelemetry(device) {
+  const [simulationSetting, emergencySetting, networkPolicySetting] = await Promise.all([
+    Setting.findOne({ key: 'SIMULATION_MODE' }),
+    Setting.findOne({ key: 'EMERGENCY_STOP' }),
+    Setting.findOne({ key: 'NETWORK_AUTHORIZATION_POLICY' }),
+  ]);
+  if (isEnabled(emergencySetting?.value, false) || isEmergencyStopActive()) {
+    return { errorCode: 'EMERGENCY_STOP', message: 'Telemetry diagnostics are disabled while emergency stop is active' };
+  }
+  if (isEnabled(simulationSetting?.value, true)) {
+    return { errorCode: 'SIMULATION_MODE', message: 'Disable simulation mode before testing live device telemetry' };
+  }
+  const approvedSubnets = await Subnet.find({
+    status: 'active',
+    approvalStatus: 'approved',
+  }).lean();
+  const networkAuthorizationPolicy = getNetworkAuthorizationPolicy(networkPolicySetting?.value);
+  const authorization = authorizeMonitoringDevice(
+    device,
+    approvedSubnets,
+    parseAllowlist(process.env.MONITORING_TARGET_ALLOWLIST),
+    {
+      authorizationMode: networkAuthorizationPolicy.mode,
+      autoAuthorizeInterfaces: networkAuthorizationPolicy.autoAuthorizeInterfaces,
+    },
+  );
+  if (!authorization.authorized) {
+    return { errorCode: authorization.code, message: authorization.reason };
+  }
+  if (device.monitoringMethod !== 'snmp') {
+    return { errorCode: 'NOT_CONFIGURED', message: 'SNMP is not selected for this device' };
+  }
+
+  const key = String(device._id);
+  const now = Date.now();
+  if (telemetryTestInProgress || now - lastTelemetryTestStartedAt < 1_000) {
+    return { errorCode: 'TEST_BUSY', message: 'Another telemetry diagnostic is already running' };
+  }
+  const lastTestAt = telemetryTestTimes.get(key);
+  if (lastTestAt !== undefined && now - lastTestAt < SNMP_TEST_COOLDOWN_MS) {
+    return { errorCode: 'COOLDOWN', message: 'Wait before running another diagnostic for this device' };
+  }
+
+  telemetryTestInProgress = true;
+  lastTelemetryTestStartedAt = now;
+  telemetryTestTimes.set(key, now);
+  const startedAt = Date.now();
+  try {
+    let snmpData;
+    try {
+      snmpData = await collectSnmp(device, { beforeRequest: () => diagnosticRateLimiter.acquire() });
+    } catch (error) {
+      const errorCode = classifySnmpError(error);
+      return {
+        deviceId: key,
+        snmpVersion: device.snmpVersion || '2c',
+        status: errorCode,
+        reason: 'SNMP collection failed',
+        collectedAt: new Date(),
+        collectionDurationMs: Date.now() - startedAt,
+        snmp: { errorCode, responded: false, oidChecks: [] },
+      };
+    }
+    return {
+      deviceId: key,
+      snmpVersion: device.snmpVersion || '2c',
+      status: snmpData.responded ? 'AVAILABLE' : (snmpData.errorCode || 'UNAVAILABLE'),
+      reason: snmpData.reason || null,
+      collectedAt: new Date(),
+      collectionDurationMs: Date.now() - startedAt,
+      snmp: snmpData,
+    };
+  } finally {
+    telemetryTestInProgress = false;
+  }
 }
 
 async function upsertAlert(device, type, severity, message) {
@@ -266,16 +664,35 @@ async function saveUnavailable(device, reason, collectionStatus = 'blocked') {
   return metric;
 }
 
-async function processDevice(device, rateLimiter, localCounterSnapshot = null) {
+async function processDevice(
+  device,
+  rateLimiter,
+  localCounterSnapshot = null,
+  approvedSubnets = null,
+  networkAuthorizationMode = 'legacy_allowlists',
+  autoAuthorizeInterfaces = false,
+) {
   if (isEmergencyStopActive()) {
     await saveUnavailable(device, 'Emergency stop is active');
     return;
   }
 
   const allowlist = parseAllowlist(process.env.MONITORING_TARGET_ALLOWLIST);
-  if (!simulationMode && !isTargetAllowed(device.ipAddress, allowlist)) {
-    await saveUnavailable(device, 'Target is not in MONITORING_TARGET_ALLOWLIST');
-    return;
+  if (!simulationMode) {
+    const activeSubnets = approvedSubnets || await Subnet.find({
+      status: 'active',
+      approvalStatus: 'approved',
+    }).lean();
+    const authorization = authorizeMonitoringDevice(
+      device,
+      activeSubnets,
+      allowlist,
+      { authorizationMode: networkAuthorizationMode, autoAuthorizeInterfaces },
+    );
+    if (!authorization.authorized) {
+      await saveUnavailable(device, authorization.reason);
+      return;
+    }
   }
 
   const startedAt = Date.now();
@@ -345,8 +762,22 @@ async function processDevice(device, rateLimiter, localCounterSnapshot = null) {
       jitter = computeJitter(rawProbes).jitterAvg;
     }
 
-    if (reachable && device.monitoringMethod === 'snmp' && !isEmergencyStopActive()) {
-      snmpData = await collectSnmp(device);
+    if (device.monitoringMethod === 'snmp' && !isEmergencyStopActive()) {
+      try {
+        snmpData = await collectSnmp(device, { beforeRequest: () => rateLimiter.acquire() });
+      } catch (error) {
+        const errorCode = classifySnmpError(error);
+        console.error(`SNMP collection failed for device ${device._id}: ${errorCode}`);
+        snmpData = {
+          supported: true,
+          responded: false,
+          errorCode,
+          reason: 'SNMP collection failed',
+        };
+      }
+      if (snmpData.responded) reachable = true;
+      cpuUtilization = snmpData.hardware?.cpu?.utilization ?? null;
+      memoryUtilization = snmpData.hardware?.memory?.utilization ?? null;
       if (snmpData.supported) {
         incomingThroughputBps = snmpData.inBps ?? null;
         outgoingThroughputBps = snmpData.outBps ?? null;
@@ -425,15 +856,59 @@ async function processDevice(device, rateLimiter, localCounterSnapshot = null) {
     currentStatus = 'WARNING';
   }
 
+  // Calculate device health score components
+  const healthResult = calculateOverallHealthScore({
+    deviceStatus: currentStatus,
+    availabilityPercent: availability,
+    latency,
+    packetLoss,
+    jitter,
+    inBps: incomingThroughputBps,
+    outBps: outgoingThroughputBps,
+    speedBps: snmpData ? snmpData.interfaceSpeed : null,
+    inErrors: snmpData ? snmpData.inErrors : null,
+    outErrors: snmpData ? snmpData.outErrors : null,
+    inDiscards: snmpData ? snmpData.inDiscards : null,
+    outDiscards: snmpData ? snmpData.outDiscards : null,
+    cpuUtilization,
+    memoryUtilization,
+    temperatureCelsius: snmpData?.hardware?.temperature?.celsius ?? null,
+    temperatureThreshold: snmpData?.hardware?.temperature?.thresholdCelsius ?? null,
+  });
+
   device.status = currentStatus;
+  device.healthScore = healthResult.overallScore;
+  device.healthStatus = healthResult.healthStatus;
   if (reachable) device.lastSeen = new Date();
   await device.save();
 
   const endedAt = new Date();
   const unavailableMetrics = {};
+  const hardwareStatus = (metricId, value) => {
+    if (simulationMode) return 'SIMULATED';
+    if (value !== null && value !== undefined) return 'AVAILABLE';
+    const failedCheck = snmpData?.oidChecks?.find((check) => (
+      check.metricId === metricId
+      && ['AUTHENTICATION_FAILED', 'TIMEOUT', 'COLLECTION_ERROR'].includes(check.responseStatus)
+    ));
+    return failedCheck?.responseStatus || snmpData?.errorCode || 'UNSUPPORTED';
+  };
   if (!simulationMode) {
-    unavailableMetrics.cpuUtilization = 'No supported device-specific OID or authorized agent is configured';
-    unavailableMetrics.memoryUtilization = 'No supported device-specific OID or authorized agent is configured';
+    if (cpuUtilization === null) {
+      unavailableMetrics.cpuUtilization = snmpData?.hardware?.cpu?.reason
+        || snmpData?.reason
+        || 'No supported CPU OID or authorized host agent is available';
+    }
+    if (memoryUtilization === null) {
+      unavailableMetrics.memoryUtilization = snmpData?.hardware?.memory?.reason
+        || snmpData?.reason
+        || 'No supported physical-memory OID or authorized host agent is available';
+    }
+    if (snmpData?.hardware?.temperature?.celsius == null) {
+      unavailableMetrics.temperature = snmpData?.hardware?.temperature?.reason
+        || (!snmpData ? 'SNMP is not configured for this device' : null)
+        || 'No supported environmental sensor OID responded';
+    }
     if (latency === null) unavailableMetrics.rtt = 'No successful ICMP round-trip sample was collected';
     if (packetLoss === null) unavailableMetrics.packetLoss = reasonUnavailable || 'No valid packet-loss measurement was collected';
     if (!snmpData) {
@@ -441,7 +916,7 @@ async function processDevice(device, rateLimiter, localCounterSnapshot = null) {
       unavailableMetrics.interfaceErrors = 'SNMP interface telemetry is not configured';
       unavailableMetrics.interfaceDrops = 'SNMP interface telemetry is not configured';
     } else {
-      if (snmpData.sysUpTime === null) unavailableMetrics.deviceUptime = snmpData.reason || 'Device did not provide sysUpTime';
+      if (snmpData.sysUpTime == null) unavailableMetrics.deviceUptime = snmpData.reason || 'Device did not provide sysUpTime';
       if (snmpData.inErrors === null || snmpData.outErrors === null) unavailableMetrics.interfaceErrors = snmpData.reason || 'Interface error counters are unsupported';
       if (snmpData.inDiscards === null || snmpData.outDiscards === null) unavailableMetrics.interfaceDrops = snmpData.reason || 'Interface discard counters are unsupported';
     }
@@ -483,12 +958,66 @@ async function processDevice(device, rateLimiter, localCounterSnapshot = null) {
     reasonUnavailable,
     measurementSource: simulationMode ? 'simulated' : 'real',
     monitoringMode: simulationMode ? 'simulation' : 'real',
-    availabilityStatus: latency === null && packetLoss === null ? 'unavailable' : 'available',
+    availabilityStatus: latency === null && packetLoss === null && !snmpData?.responded
+      ? 'unavailable'
+      : 'available',
     validity: collectionStatus === 'error' ? 'unknown' : 'valid',
     observationWindowStart: new Date(startedAt),
     observationWindowEnd: endedAt,
     sampleCount: rawProbes.length,
     snmp: snmpData,
+    hardware: {
+      cpu: {
+        utilization: cpuUtilization,
+        load: snmpData?.hardware?.cpu?.load ?? null,
+        perCore: snmpData?.hardware?.cpu?.perCore || [],
+        source: simulationMode ? 'simulation' : snmpData?.hardware?.cpu?.source || null,
+        reason: simulationMode
+          ? 'Simulated value; not measured from this device'
+          : unavailableMetrics.cpuUtilization || null,
+      },
+      memory: {
+        utilization: memoryUtilization,
+        totalBytes: snmpData?.hardware?.memory?.totalBytes ?? null,
+        usedBytes: snmpData?.hardware?.memory?.usedBytes ?? null,
+        freeBytes: snmpData?.hardware?.memory?.freeBytes ?? null,
+        source: simulationMode ? 'simulation' : snmpData?.hardware?.memory?.source || null,
+        reason: simulationMode
+          ? 'Simulated value; not measured from this device'
+          : unavailableMetrics.memoryUtilization || null,
+      },
+      system: {
+        sysDescr: snmpData?.hardware?.system?.sysDescr ?? null,
+        sysUpTime: snmpData?.sysUpTime ?? null,
+        sysName: snmpData?.hardware?.system?.sysName ?? null,
+        sysLocation: snmpData?.hardware?.system?.sysLocation ?? null,
+      },
+      temperature: {
+        celsius: snmpData?.hardware?.temperature?.celsius ?? null,
+        thresholdCelsius: snmpData?.hardware?.temperature?.thresholdCelsius ?? null,
+        source: simulationMode ? null : snmpData?.hardware?.temperature?.source || null,
+        reason: simulationMode
+          ? 'Temperature is not simulated or measured'
+          : unavailableMetrics.temperature || null,
+      },
+      availability: {
+        cpu: hardwareStatus('cpu_utilization', cpuUtilization),
+        memory: hardwareStatus('memory_utilization', memoryUtilization),
+        temperature: simulationMode ? 'UNSUPPORTED'
+          : hardwareStatus('temperature', snmpData?.hardware?.temperature?.celsius),
+        uptime: simulationMode ? 'UNSUPPORTED'
+          : hardwareStatus('device_uptime', snmpData?.sysUpTime),
+      },
+    },
+    telemetryChecks: snmpData?.oidChecks || [],
+    health: healthResult,
+    reachability: {
+      confirmedMethod: snmpData?.responded ? 'snmp' : (reachable ? 'icmp' : 'none'),
+      isReachable: Boolean(reachable),
+      methodsChecked: [device.monitoringMethod === 'snmp' ? 'snmp' : 'icmp'],
+      methodsResponding: reachable ? [snmpData?.responded ? 'snmp' : 'icmp'] : [],
+      reason: reachable ? `Reachable via ${snmpData?.responded ? 'SNMP' : 'ICMP'}` : 'Unreachable',
+    },
     metadata: trafficInterface?.metadata,
     raw: rawProbes.length > 0 ? { probes: rawProbes } : undefined,
     derived: {
@@ -498,6 +1027,7 @@ async function processDevice(device, rateLimiter, localCounterSnapshot = null) {
       inboundDroppedPackets: snmpData ? snmpData.inDiscards : null,
       outboundDroppedPackets: snmpData ? snmpData.outDiscards : null,
       interfaceSpeedBps: snmpData ? snmpData.interfaceSpeed : null,
+      interfaceHighSpeedMbps: snmpData ? snmpData.interfaceHighSpeedMbps : null,
       interfaceOperationalStatus: snmpData ? snmpData.operationalStatus : null,
       deviceUptimeSeconds: snmpData && snmpData.sysUpTime !== null ? snmpData.sysUpTime / 100 : null,
       inboundInterfaceUtilizationPercent: snmpData && snmpData.interfaceSpeed > 0 && incomingThroughputBps !== null
@@ -511,6 +1041,7 @@ async function processDevice(device, rateLimiter, localCounterSnapshot = null) {
     },
   });
 
+  // 1. Device Offline / Recovered Alerts
   if (currentStatus === 'DOWN') {
     await upsertAlert(device, 'DEVICE_DOWN', 'CRITICAL', `${device.name} is unreachable`);
   } else if (currentStatus === 'UP' || currentStatus === 'WARNING') {
@@ -530,6 +1061,7 @@ async function processDevice(device, rateLimiter, localCounterSnapshot = null) {
     }
   }
 
+  // 2. Latency / Packet Loss Alerts
   if (reachable && (
     (latency !== null && latency >= thresholds.LATENCY_CRITICAL) ||
     (packetLoss !== null && packetLoss >= thresholds.PACKET_LOSS_CRITICAL)
@@ -542,6 +1074,38 @@ async function processDevice(device, rateLimiter, localCounterSnapshot = null) {
     await upsertAlert(device, 'PERFORMANCE_DEGRADATION', 'MEDIUM', `${device.name} exceeded a warning latency or packet-loss threshold`);
   } else if (currentStatus !== 'UNKNOWN') {
     await resolveAlert(device, 'PERFORMANCE_DEGRADATION');
+  }
+
+  // 3. High CPU Alerts
+  if (reachable && cpuUtilization !== null && cpuUtilization >= thresholds.CPU_CRITICAL) {
+    await upsertAlert(device, 'HIGH_CPU', 'CRITICAL', `${device.name} CPU utilization is critical at ${cpuUtilization}%`);
+  } else if (reachable && cpuUtilization !== null && cpuUtilization >= thresholds.CPU_WARNING) {
+    await upsertAlert(device, 'HIGH_CPU', 'HIGH', `${device.name} CPU utilization is elevated at ${cpuUtilization}%`);
+  } else if (currentStatus !== 'UNKNOWN' && cpuUtilization !== null) {
+    await resolveAlert(device, 'HIGH_CPU');
+  }
+
+  // 4. High Memory Alerts
+  if (reachable && memoryUtilization !== null && memoryUtilization >= thresholds.MEMORY_CRITICAL) {
+    await upsertAlert(device, 'HIGH_MEMORY', 'CRITICAL', `${device.name} memory utilization is critical at ${memoryUtilization}%`);
+  } else if (reachable && memoryUtilization !== null && memoryUtilization >= thresholds.MEMORY_WARNING) {
+    await upsertAlert(device, 'HIGH_MEMORY', 'HIGH', `${device.name} memory utilization is elevated at ${memoryUtilization}%`);
+  } else if (currentStatus !== 'UNKNOWN' && memoryUtilization !== null) {
+    await resolveAlert(device, 'HIGH_MEMORY');
+  }
+
+  // 5. Interface Errors
+  if (reachable && snmpData && ((snmpData.inErrors || 0) > 0 || (snmpData.outErrors || 0) > 0)) {
+    await upsertAlert(device, 'INTERFACE_ERRORS', 'MEDIUM', `${device.name} detected interface errors (In: ${snmpData.inErrors || 0}, Out: ${snmpData.outErrors || 0})`);
+  } else if (currentStatus !== 'UNKNOWN' && snmpData && snmpData.inErrors === 0 && snmpData.outErrors === 0) {
+    await resolveAlert(device, 'INTERFACE_ERRORS');
+  }
+
+  // 6. Critical Device Health Alerts
+  if (reachable && healthResult.overallScore !== null && healthResult.overallScore < thresholds.HEALTH_CRITICAL) {
+    await upsertAlert(device, 'CRITICAL_DEVICE_HEALTH', 'CRITICAL', `${device.name} overall health score is critical (${healthResult.overallScore}/100)`);
+  } else if (currentStatus !== 'UNKNOWN' && healthResult.overallScore !== null && healthResult.overallScore >= thresholds.HEALTH_CRITICAL) {
+    await resolveAlert(device, 'CRITICAL_DEVICE_HEALTH');
   }
 
   const publicDevice = device.toJSON();
@@ -560,6 +1124,48 @@ function startMonitoring() {
   const semaphore = new Semaphore(concurrency);
   const rateLimiter = createRateLimiter({ maxPerSecond: maxProbesPerSecond });
 
+  const runScheduledDiscovery = async () => {
+    if (scheduledDiscoveryRunning || simulationMode || isEmergencyStopActive()) return;
+    scheduledDiscoveryRunning = true;
+    try {
+      const dueSubnets = await Subnet.find({
+        status: 'active',
+        approvalStatus: 'approved',
+        discoveryScheduleEnabled: true,
+        nextDiscoveryAt: { $lte: new Date() },
+      }).sort({ nextDiscoveryAt: 1 }).limit(10).lean();
+      const discoveryAllowlist = parseAllowlist(process.env.DISCOVERY_ALLOWLIST);
+      const [authorizationSetting, networkPolicySetting] = await Promise.all([
+        Setting.findOne({ key: 'DISCOVERY_AUTHORIZATION_MODE' }),
+        Setting.findOne({ key: 'NETWORK_AUTHORIZATION_POLICY' }),
+      ]);
+      const authorizationMode = getEffectiveDiscoveryAuthorizationMode(
+        networkPolicySetting?.value,
+        authorizationSetting?.value,
+      );
+      const subnet = dueSubnets.find((candidate) => (
+        Boolean(candidate.scheduleConfiguredBy || candidate.approvedBy)
+        && (candidate.authorizationSource !== 'interface_policy'
+          || getNetworkAuthorizationPolicy(networkPolicySetting?.value).autoAuthorizeInterfaces)
+        && isFreshInterfaceAuthorization(candidate)
+        && Boolean(getApprovedSubnetDiscoveryHosts(candidate, discoveryAllowlist, authorizationMode).hosts)
+      ));
+      if (!subnet) return;
+      await runDiscoveryForSubnet({
+        subnetId: subnet._id,
+        requestedBy: subnet.scheduleConfiguredBy || subnet.approvedBy,
+        trigger: 'scheduled',
+        options: { resolveDns: false, checkServices: false, ports: [] },
+      });
+    } catch (error) {
+      if (error.statusCode !== 409 && error.statusCode !== 429) {
+        console.error('Scheduled discovery failed:', error.statusCode || error.name || 'UnknownError');
+      }
+    } finally {
+      scheduledDiscoveryRunning = false;
+    }
+  };
+
   const runCycle = async () => {
     try {
       await updateSettingsCache();
@@ -569,7 +1175,13 @@ function startMonitoring() {
       }
 
       const now = Date.now();
-      const devices = await Device.find({ monitoringStatus: true });
+      const [devices, approvedSubnets, networkPolicySetting] = await Promise.all([
+        Device.find({ monitoringStatus: true }),
+        Subnet.find({ status: 'active', approvalStatus: 'approved' }).lean(),
+        Setting.findOne({ key: 'NETWORK_AUTHORIZATION_POLICY' }),
+      ]);
+      const networkAuthorizationPolicy = getNetworkAuthorizationPolicy(networkPolicySetting?.value);
+      const monitoringAllowlist = parseAllowlist(process.env.MONITORING_TARGET_ALLOWLIST);
       const dueDevices = devices.filter((device) => {
         const previousPoll = lastPolledAt.get(String(device._id)) || 0;
         if (!isDeviceDueForPolling(device, now, previousPoll) || isEmergencyStopActive()) return false;
@@ -579,7 +1191,15 @@ function startMonitoring() {
 
       let localCounterSnapshot = null;
       const hasAuthorizedTargets = dueDevices.some((device) => (
-        isTargetAllowed(device.ipAddress, parseAllowlist(process.env.MONITORING_TARGET_ALLOWLIST))
+        authorizeMonitoringDevice(
+          device,
+          approvedSubnets,
+          monitoringAllowlist,
+          {
+            authorizationMode: networkAuthorizationPolicy.mode,
+            autoAuthorizeInterfaces: networkAuthorizationPolicy.autoAuthorizeInterfaces,
+          },
+        ).authorized
       ));
       if (!simulationMode && process.platform === 'win32' && hasAuthorizedTargets) {
         try {
@@ -593,7 +1213,14 @@ function startMonitoring() {
         const release = await semaphore.acquire();
         try {
           if (!isEmergencyStopActive()) {
-            await processDevice(device, rateLimiter, localCounterSnapshot);
+            await processDevice(
+              device,
+              rateLimiter,
+              localCounterSnapshot,
+              approvedSubnets,
+              networkAuthorizationPolicy.mode,
+              networkAuthorizationPolicy.autoAuthorizeInterfaces,
+            );
           }
         } finally {
           release();
@@ -613,14 +1240,31 @@ function startMonitoring() {
     });
     return currentCyclePromise;
   });
+  discoveryTask = cron.schedule('*/30 * * * * *', runScheduledDiscovery);
+  interfaceAuthorizationTask = cron.schedule('*/1 * * * *', () => {
+    synchronizeConnectedInterfaces()
+      .catch((error) => console.error('Connected interface authorization sync failed:', error.name || 'UnknownError'));
+  });
   console.log('Monitoring engine started');
 }
 
 async function stopMonitoring() {
   if (monitoringTask) monitoringTask.stop();
   monitoringTask = null;
+  if (discoveryTask) discoveryTask.stop();
+  discoveryTask = null;
+  if (interfaceAuthorizationTask) interfaceAuthorizationTask.stop();
+  interfaceAuthorizationTask = null;
   monitoringStarted = false;
   if (currentCyclePromise) await currentCyclePromise;
 }
 
-module.exports = { startMonitoring, stopMonitoring, processDevice, updateSettingsCache };
+module.exports = {
+  startMonitoring,
+  stopMonitoring,
+  processDevice,
+  updateSettingsCache,
+  collectSnmp,
+  classifySnmpError,
+  testDeviceTelemetry,
+};

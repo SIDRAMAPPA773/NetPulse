@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useContext, useState, useEffect } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import api from '../services/api';
 import { getSocket } from '../services/socket';
@@ -20,17 +20,32 @@ import {
   AlertTriangle,
   Router,
   ShieldCheck,
-  Radio
+  Radio,
+  Thermometer,
+  Layers,
+  Heart,
+  Network,
+  Printer,
+  Laptop
 } from 'lucide-react';
 import { format } from 'date-fns';
 import clsx from 'clsx';
+import { AuthContext } from '../context/AuthContext';
 
 const formatBitRate = (value) => {
-  if (value === null || value === undefined || !Number.isFinite(value)) return 'Unavailable';
+  if (value === null || value === undefined || !Number.isFinite(value)) return 'Not collected';
   if (value >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(2)} Gbit/s`;
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)} Mbit/s`;
   if (value >= 1_000) return `${(value / 1_000).toFixed(2)} kbit/s`;
   return `${value.toFixed(0)} bit/s`;
+};
+
+const formatBytes = (bytes) => {
+  if (bytes === null || bytes === undefined || !Number.isFinite(bytes)) return 'Not collected';
+  if (bytes >= 1_073_741_824) return `${(bytes / 1_073_741_824).toFixed(2)} GB`;
+  if (bytes >= 1_048_576) return `${(bytes / 1_048_576).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${bytes} B`;
 };
 
 const formatTimestamp = (value) => {
@@ -48,30 +63,58 @@ const formatTimestamp = (value) => {
   }).format(date);
 };
 
+const formatInterfaceStatus = (value) => ({
+  1: 'up',
+  2: 'down',
+  3: 'testing',
+  4: 'unknown',
+  5: 'dormant',
+  6: 'not present',
+  7: 'lower-layer down',
+}[value] || (value == null ? 'Not collected' : `Unrecognized state (${value})`));
+
+const getDeviceIcon = (type) => {
+  switch (type) {
+    case 'router': return <Router className="w-5 h-5 text-sky-600" />;
+    case 'switch': return <Network className="w-5 h-5 text-indigo-600" />;
+    case 'server': return <Server className="w-5 h-5 text-emerald-600" />;
+    case 'pc': return <Laptop className="w-5 h-5 text-slate-600" />;
+    case 'printer': return <Printer className="w-5 h-5 text-amber-600" />;
+    case 'ap': return <Radio className="w-5 h-5 text-purple-600" />;
+    default: return <Server className="w-5 h-5 text-slate-500" />;
+  }
+};
+
 const DeviceDetails = () => {
   const { id } = useParams();
+  const { user } = useContext(AuthContext);
   const [device, setDevice] = useState(null);
   const [metrics, setMetrics] = useState([]);
   const [alerts, setAlerts] = useState([]);
   const [latestCollection, setLatestCollection] = useState(null);
   const [latestSuccessfulMeasurement, setLatestSuccessfulMeasurement] = useState(null);
+  const [metricCoverage, setMetricCoverage] = useState(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [range, setRange] = useState('1h');
+  const [diagnosticBusy, setDiagnosticBusy] = useState(false);
+  const [diagnosticMessage, setDiagnosticMessage] = useState('');
 
   useEffect(() => {
     let active = true;
     const fetchData = async () => {
       try {
-        const [deviceRes, metricsRes, alertsRes] = await Promise.all([
+        const [deviceRes, metricsRes, alertsRes, coverageRes] = await Promise.all([
           api.get(`/devices/${id}`),
           api.get(`/devices/${id}/metrics?range=${range}`),
-          api.get(`/alerts?device=${id}`)
+          api.get(`/alerts?device=${id}`),
+          api.get(`/metrics/coverage?device=${id}`)
         ]);
         if (!active) return;
         setDevice(deviceRes.data);
         setMetrics(metricsRes.data);
         setAlerts(alertsRes.data);
+        setMetricCoverage(coverageRes.data);
         setLatestCollection(deviceRes.data.latestCollection);
         setLatestSuccessfulMeasurement(deviceRes.data.latestSuccessfulMeasurement);
         setLoadError('');
@@ -87,53 +130,52 @@ const DeviceDetails = () => {
     fetchData();
 
     const socket = getSocket();
+    const handleDeviceUpdated = (updatedDevice) => {
+      if (updatedDevice._id === id) setDevice(updatedDevice);
+    };
+    const handleMetricAdded = (newMetric) => {
+      const metricDeviceId = typeof newMetric.device === 'object' ? newMetric.device?._id : newMetric.device;
+      if (metricDeviceId === id) {
+        setMetrics(prev => [newMetric, ...prev].slice(0, 50));
+        setLatestCollection(newMetric);
+      }
+    };
+
     if (socket) {
-      socket.on('deviceUpdated', (updatedDevice) => {
-        if (updatedDevice._id === id) setDevice(updatedDevice);
-      });
-      socket.on('metricAdded', (newMetric) => {
-        if (newMetric.device === id) {
-          setMetrics(prev => [newMetric, ...prev].slice(0, 50));
-          setLatestCollection(newMetric);
-          if (newMetric.availabilityStatus === 'available') {
-            setLatestSuccessfulMeasurement({
-              createdAt: newMetric.createdAt,
-              measurementSource: newMetric.measurementSource,
-              monitoringMode: newMetric.monitoringMode,
-            });
-          }
-        }
-      });
-      socket.on('newAlert', (newAlert) => {
-        if (newAlert.device?._id === id) setAlerts(prev => [newAlert, ...prev].slice(0, 100));
-      });
+      socket.on('deviceUpdated', handleDeviceUpdated);
+      socket.on('metricAdded', handleMetricAdded);
     }
 
     return () => {
       active = false;
       if (socket) {
-        socket.off('deviceUpdated');
-        socket.off('metricAdded');
-        socket.off('newAlert');
+        socket.off('deviceUpdated', handleDeviceUpdated);
+        socket.off('metricAdded', handleMetricAdded);
       }
     };
   }, [id, range]);
 
   if (loading) {
     return (
-      <div className="flex flex-col items-center justify-center min-h-[50vh] space-y-3">
-        <div className="w-10 h-10 rounded-full border-2 border-sky-200 border-t-sky-600 animate-spin" />
-        <p className="text-xs text-slate-500 font-medium">Loading hardware telemetry...</p>
+      <div className="space-y-6 pb-12 w-full min-w-0">
+        <div className="h-10 w-48 bg-slate-200 animate-pulse rounded-xl" />
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          {Array.from({ length: 4 }, (_, i) => (
+            <div key={i} className="h-28 bg-slate-100 rounded-2xl animate-pulse" />
+          ))}
+        </div>
+        <div className="h-72 bg-slate-100 rounded-2xl animate-pulse" />
       </div>
     );
   }
 
-  if (!device) {
+  if (loadError || !device) {
     return (
-      <div className="p-8 text-center text-rose-700 glass-card-static rounded-2xl border border-rose-200 bg-rose-50">
-        <AlertTriangle className="w-8 h-8 mx-auto mb-2 text-rose-600" />
-        <p className="font-bold">{loadError || 'Hardware node not found in registry.'}</p>
-        <Link to="/devices" className="text-sky-600 underline text-xs mt-3 inline-block">Back to Fleet</Link>
+      <div className="py-16 text-center text-sm text-rose-700">
+        <p>{loadError || 'Device not found.'}</p>
+        <Link to="/devices" className="mt-3 inline-block px-4 py-2 rounded-xl border border-rose-300 font-semibold">
+          Return to devices list
+        </Link>
       </div>
     );
   }
@@ -157,6 +199,7 @@ const DeviceDetails = () => {
   const isLastSuccessfulMeasurementStale = lastSuccessfulAt
     && latestMetric.createdAt
     && new Date(latestMetric.createdAt).getTime() > new Date(lastSuccessfulAt).getTime();
+
   const collectionExplanation = isAllowlistBlocked
     ? 'No ICMP probe was run because this target is not authorized by MONITORING_TARGET_ALLOWLIST. This is an authorization block, not evidence that the device is unreachable.'
     : latestMetric.collectionStatus === 'timeout' || latestMetric.collectionStatus === 'unreachable'
@@ -167,6 +210,46 @@ const DeviceDetails = () => {
           ? 'The latest telemetry collection failed with an error.'
           : null);
 
+  const hardware = latestMetric.hardware || {};
+  const health = latestMetric.health || {};
+  const reasonForMetric = (metricId, fallback) => (
+    latestDerived.unavailableMetrics?.[metricId]
+    || latestMetric.snmp?.oidChecks?.find(check => check.metricId === metricId)?.reason
+    || fallback
+  );
+  const overallHealthScore = device.healthScore ?? health.overallScore ?? null;
+  const healthStatus = device.healthStatus || health.healthStatus || 'Unknown';
+  const telemetryDiagnostics = device.telemetryDiagnostics || (
+    latestMetric.snmp?.oidChecks?.length
+      ? {
+        status: latestMetric.snmp.responded ? 'AVAILABLE' : latestMetric.snmp.errorCode || 'UNAVAILABLE',
+        reason: latestMetric.snmp.reason,
+        snmpVersion: device.snmpVersion,
+        collectedAt: latestMetric.createdAt,
+        checks: latestMetric.snmp.oidChecks,
+      }
+      : null
+  );
+  const telemetryCollector = (key, fallbackStatus, fallbackReason) => [
+    telemetryDiagnostics?.collectors?.[key]?.status || fallbackStatus,
+    telemetryDiagnostics?.collectors?.[key]?.reason || fallbackReason,
+  ];
+  const runTelemetryDiagnostic = async () => {
+    setDiagnosticBusy(true);
+    setDiagnosticMessage('');
+    try {
+      const { data } = await api.post(`/devices/${id}/telemetry/test`);
+      setDevice((current) => ({ ...current, telemetryDiagnostics: data }));
+      setDiagnosticMessage(`Diagnostic completed: ${data.status}`);
+    } catch (error) {
+      const message = error.response?.data?.reason || error.response?.data?.message
+        || 'Unable to run telemetry diagnostic.';
+      setDiagnosticMessage(message);
+    } finally {
+      setDiagnosticBusy(false);
+    }
+  };
+
   return (
     <div className="w-full min-w-0 space-y-6 pb-12">
       
@@ -175,7 +258,7 @@ const DeviceDetails = () => {
         <div className="flex items-center gap-3">
           <Link 
             to="/devices" 
-            className="p-2.5 rounded-xl bg-white hover:bg-slate-100 border border-slate-200 text-slate-700 transition-colors shadow-2xs"
+            className="p-2.5 rounded-xl bg-white hover:bg-slate-100 border border-slate-200 text-slate-700 transition-colors shadow-2xs cursor-pointer"
           >
             <ArrowLeft className="w-4 h-4" />
           </Link>
@@ -199,26 +282,117 @@ const DeviceDetails = () => {
                 )} />
                 {device.status}
               </span>
+
+              {overallHealthScore !== null && (
+                <span className={clsx(
+                  "px-2.5 py-1 rounded-full text-[10px] font-bold tracking-wide uppercase border flex items-center gap-1",
+                  overallHealthScore >= 80 ? "bg-emerald-50 text-emerald-700 border-emerald-200" :
+                  overallHealthScore >= 60 ? "bg-amber-50 text-amber-700 border-amber-200" :
+                  "bg-rose-50 text-rose-700 border-rose-200"
+                )}>
+                  Health: {overallHealthScore}% ({healthStatus})
+                </span>
+              )}
             </div>
 
-            <div className="flex items-center gap-3 mt-1 text-xs">
+            <div className="flex items-center gap-2.5 mt-1 text-xs flex-wrap">
               <span className="font-mono text-slate-800 font-bold px-2 py-0.5 rounded bg-slate-100 border border-slate-200">
                 {device.ipAddress}
               </span>
+              {device.macAddress && (
+                <span className="font-mono text-slate-600 px-2 py-0.5 rounded bg-slate-100 border border-slate-200">
+                  MAC: {device.macAddress}
+                </span>
+              )}
+              {device.vendor && device.vendor !== 'Unknown' && (
+                <span className="font-bold text-blue-700 bg-blue-50 px-2 py-0.5 rounded border border-blue-200">
+                  {device.vendor}
+                </span>
+              )}
               <span className="text-slate-500 capitalize">{device.type}</span>
               <span className="text-slate-300">•</span>
-              <span className="text-slate-500">{device.location || 'Location unavailable'}</span>
+              <span className="text-slate-500">{device.location || 'Location unassigned'}</span>
             </div>
           </div>
         </div>
 
-        {/* Polling badge */}
+        {/* Polling & Protocol badge */}
         <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-white border border-slate-200 text-xs text-slate-600 self-start sm:self-auto font-mono shadow-2xs">
           <Radio className="w-3.5 h-3.5 text-sky-600 animate-pulse" />
-          <span>Polling: Every {device.pollingInterval || 10}s</span>
+          <span>Polling: Every {device.pollingInterval || 30}s</span>
+          {device.reachabilityMethod && (
+            <span className="ml-1 uppercase font-bold text-indigo-700 bg-indigo-50 px-1.5 py-0.2 rounded border border-indigo-200 text-[10px]">
+              {device.reachabilityMethod}
+            </span>
+          )}
         </div>
       </div>
 
+      <section className="glass-card-static rounded-2xl border border-slate-200 p-5 space-y-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h2 className="text-base font-bold text-slate-900">Telemetry diagnostics</h2>
+            <p className="text-xs text-slate-500">
+              Bounded SNMP checks only; live diagnostics require an approved target and simulation mode off.
+            </p>
+          </div>
+          {user?.role === 'admin' && (
+            <button
+              type="button"
+              onClick={runTelemetryDiagnostic}
+              disabled={diagnosticBusy}
+              className="rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs font-bold text-sky-800 disabled:cursor-wait disabled:opacity-60"
+            >
+              {diagnosticBusy ? 'Testing telemetry…' : 'Test Telemetry'}
+            </button>
+          )}
+        </div>
+        {diagnosticMessage && <p role="status" className="text-xs text-slate-600">{diagnosticMessage}</p>}
+        <div className="grid gap-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
+          {[
+            ['SNMP connectivity', telemetryDiagnostics?.status || (latestMetric.snmp?.responded ? 'AVAILABLE' : 'NOT TESTED'), telemetryDiagnostics?.reason],
+            ['SNMP version', telemetryDiagnostics?.snmpVersion || device.snmpVersion || 'Not configured', null],
+            ['Agent availability', ...telemetryCollector('agent', 'NOT_CONFIGURED', 'No authenticated Windows or Linux host exporter is configured')],
+            ['CPU collector', ...telemetryCollector('cpu', hardware.availability?.cpu || 'UNSUPPORTED', hardware.cpu?.reason || 'No supported CPU collector returned a value')],
+            ['Memory collector', ...telemetryCollector('memory', hardware.availability?.memory || 'UNSUPPORTED', hardware.memory?.reason || 'No supported physical-memory collector returned a value')],
+            ['Temperature collector', ...telemetryCollector('temperature', hardware.availability?.temperature || 'UNSUPPORTED', hardware.temperature?.reason || 'No supported environmental sensor OID responded')],
+            ['Uptime collector', ...telemetryCollector('uptime', hardware.availability?.uptime || 'UNAVAILABLE', hardware.system?.sysUpTime == null ? 'SNMPv2-MIB sysUpTime.0 was not returned' : null)],
+            ['Interface collector', ...telemetryCollector('interface', latestMetric.snmp?.countersSupported ? 'AVAILABLE' : 'NOT_CONFIGURED', latestMetric.snmp?.reason || 'Configure an interface index and supported IF-MIB counters')],
+          ].map(([label, value, reason]) => (
+            <div key={label} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+              <p className="font-semibold uppercase tracking-wide text-slate-500">{label}</p>
+              <p className="mt-1 break-words font-medium text-slate-800">{value}</p>
+              {reason && <p className="mt-1 break-words text-slate-600">{reason}</p>}
+            </div>
+          ))}
+        </div>
+        <div className="grid gap-2 text-xs text-slate-600 sm:grid-cols-2">
+          <p>Last successful collection: {formatTimestamp(telemetryDiagnostics?.checks?.find(check => check.responseStatus === 'AVAILABLE')?.collectedAt)}</p>
+          <p>Most recent failure: {telemetryDiagnostics?.checks?.find(check => check.reason)?.reason || telemetryDiagnostics?.reason || 'None recorded'}</p>
+        </div>
+        {telemetryDiagnostics?.checks?.length > 0 && (
+          <div className="overflow-x-auto border-t border-slate-100 pt-3">
+            <h3 className="mb-2 text-xs font-bold text-slate-700">Supported OID checks</h3>
+            <table className="w-full min-w-[560px] text-left text-[11px]">
+              <thead className="text-slate-500">
+                <tr><th className="pb-2 pr-3">OID</th><th className="pb-2 pr-3">Result</th><th className="pb-2 pr-3">Value</th><th className="pb-2">Interface</th></tr>
+              </thead>
+              <tbody>
+                {telemetryDiagnostics.checks.map((check, index) => (
+                  <tr key={`${check.oid}-${index}`} className="border-t border-slate-100">
+                    <td className="py-2 pr-3 font-mono">{check.oid}</td>
+                    <td className="py-2 pr-3">{check.responseStatus}</td>
+                    <td className="py-2 pr-3">{check.value ?? check.reason ?? 'No value returned'}</td>
+                    <td className="py-2">{check.interfaceId || 'System'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      {/* Freshness & Monitoring Safety Banner */}
       {latestMetric.createdAt && (
         <section
           className={`w-full min-w-0 rounded-2xl border p-4 ${
@@ -234,9 +408,9 @@ const DeviceDetails = () => {
           {collectionExplanation && (
             <p className="mt-1 break-words text-sm text-slate-700">{collectionExplanation}</p>
           )}
-          <div className="mt-3 grid min-w-0 gap-2 text-xs text-slate-600 sm:grid-cols-2">
+          <div className="mt-2.5 grid min-w-0 gap-2 text-xs text-slate-600 sm:grid-cols-2">
             <p className="min-w-0 break-words">
-              Latest collection: {latestMetric.measurementSource || 'unknown'} ({latestMetric.collectionStatus || 'unknown'}) at {formatTimestamp(latestMetric.createdAt)}.
+              Latest observation: {latestMetric.measurementSource || 'unknown'} ({latestMetric.collectionStatus || 'unknown'}) at {formatTimestamp(latestMetric.createdAt)}.
             </p>
             <p className="min-w-0 break-words">
               Last successful measurement: {formatTimestamp(lastSuccessfulAt)}
@@ -245,10 +419,10 @@ const DeviceDetails = () => {
             </p>
           </div>
           {Object.keys(latestMetric.derived?.unavailableMetrics || {}).length > 0 && (
-            <ul className="mt-3 grid min-w-0 gap-2 text-xs text-slate-600 sm:grid-cols-2">
-              {Object.entries(latestMetric.derived.unavailableMetrics).map(([metric, reason]) => (
-                <li key={metric} className="min-w-0 break-words">
-                  <span className="font-semibold">{metric}:</span> {reason}
+            <ul className="mt-3 grid min-w-0 gap-2 text-xs text-slate-600 sm:grid-cols-2 border-t border-slate-200/60 pt-2.5">
+              {Object.entries(latestMetric.derived.unavailableMetrics).map(([metricKey, reason]) => (
+                <li key={metricKey} className="min-w-0 break-words">
+                  <span className="font-semibold text-slate-700">{metricKey}:</span> {reason}
                 </li>
               ))}
             </ul>
@@ -256,100 +430,288 @@ const DeviceDetails = () => {
         </section>
       )}
 
-      {/* 4 Metric KPI Cards */}
-      <div className="grid min-w-0 grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        
-        <div className="glass-card min-w-0 rounded-2xl p-5 border border-slate-200 relative overflow-hidden">
-          <div className="flex items-center justify-between text-xs text-slate-500 font-bold mb-2">
-            <span>PING ROUNDTRIP</span>
-            <Activity className="w-4 h-4 text-sky-600" />
+      {/* Device Health Score Breakdown Card */}
+      <section className="glass-card-static rounded-2xl border border-slate-200 p-5 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-100 pb-3">
+          <div>
+            <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
+              <Heart className="w-4 h-4 text-rose-500" />
+              Composite Device Health Assessment
+            </h2>
+            <p className="text-xs text-slate-500">
+              Evaluates available component metrics. Unsupported measurements are excluded without penalizing as zero.
+            </p>
           </div>
-          <div className="flex items-baseline gap-1">
-            <span className="text-3xl font-extrabold text-slate-900 font-mono">{latestMetric.latency ?? 'Unavailable'}</span>
-            {latestMetric.latency !== null && latestMetric.latency !== undefined && <span className="text-xs text-slate-500 font-sans">ms</span>}
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-semibold text-slate-500">Overall Score:</span>
+            <span className={clsx(
+              "font-mono text-xl font-extrabold px-3 py-0.5 rounded-xl border",
+              overallHealthScore === null ? "bg-slate-100 text-slate-600 border-slate-200" :
+              overallHealthScore >= 80 ? "bg-emerald-50 text-emerald-700 border-emerald-200" :
+              overallHealthScore >= 60 ? "bg-amber-50 text-amber-700 border-amber-200" :
+              "bg-rose-50 text-rose-700 border-rose-200"
+            )}>
+              {overallHealthScore !== null ? `${overallHealthScore}/100` : 'Unknown'}
+            </span>
           </div>
-          <div className="mt-2 text-[11px] text-sky-700 font-semibold">
-            {latestMetric.latency === null || latestMetric.latency === undefined
-              ? 'No successful RTT sample'
-              : latestMetric.latency < 50 ? 'Nominal response time' : 'Elevated response'}
-          </div>
-          <div className="absolute bottom-0 left-0 right-0 h-1 bg-sky-500" />
         </div>
 
-        <div className="glass-card min-w-0 rounded-2xl p-5 border border-slate-200 relative overflow-hidden">
-          <div className="flex items-center justify-between text-xs text-slate-500 font-bold mb-2">
-            <span>PACKET DROP RATE</span>
-            <ShieldCheck className="w-4 h-4 text-emerald-600" />
-          </div>
-          <div className="flex items-baseline gap-1">
-            <span className="text-3xl font-extrabold text-slate-900 font-mono">{latestMetric.packetLoss ?? 'Unavailable'}</span>
-            {latestMetric.packetLoss !== null && latestMetric.packetLoss !== undefined && <span className="text-xs text-slate-500 font-sans">%</span>}
-          </div>
-          <div className="mt-2 text-[11px] text-emerald-700 font-semibold">
-            {latestMetric.packetLoss === null || latestMetric.packetLoss === undefined
-              ? 'No probe result available'
-              : latestMetric.packetLoss === 0 ? 'No loss observed in this probe window' : 'Loss detected'}
-          </div>
-          <div className="absolute bottom-0 left-0 right-0 h-1 bg-emerald-500" />
-        </div>
-
-        <div className="glass-card min-w-0 rounded-2xl p-5 border border-slate-200 relative overflow-hidden">
-          <div className="flex items-center justify-between text-xs text-slate-500 font-bold mb-2">
-            <span>CPU UTILIZATION</span>
-            <Cpu className="w-4 h-4 text-indigo-600" />
-          </div>
-          <div className="flex items-baseline gap-1">
-            <span className="text-3xl font-extrabold text-slate-900 font-mono">{latestMetric.cpuUtilization ?? 'Unavailable'}</span>
-            {latestMetric.cpuUtilization !== null && latestMetric.cpuUtilization !== undefined && <span className="text-xs text-slate-500 font-sans">%</span>}
-          </div>
-          <div className="mt-2 text-[11px] text-indigo-700 font-semibold">
-            Only available with a supported SNMP MIB or authorized agent
-          </div>
-          <div className="absolute bottom-0 left-0 right-0 h-1 bg-indigo-500" />
-        </div>
-
-        <div className="glass-card min-w-0 rounded-2xl p-5 border border-slate-200 relative overflow-hidden">
-          <div className="flex items-center justify-between text-xs text-slate-500 font-bold mb-2">
-            <span>MEMORY USAGE</span>
-            <HardDrive className="w-4 h-4 text-purple-600" />
-          </div>
-          <div className="flex items-baseline gap-1">
-            <span className="text-3xl font-extrabold text-slate-900 font-mono">{latestMetric.memoryUtilization ?? 'Unavailable'}</span>
-            {latestMetric.memoryUtilization !== null && latestMetric.memoryUtilization !== undefined && <span className="text-xs text-slate-500 font-sans">%</span>}
-          </div>
-          <div className="mt-2 text-[11px] text-purple-700 font-semibold">
-            Only available with a supported SNMP MIB or authorized agent
-          </div>
-          <div className="absolute bottom-0 left-0 right-0 h-1 bg-purple-500" />
-        </div>
-
-      </div>
-
-      <section className="glass-card-static rounded-2xl border border-slate-200 p-5">
-        <h2 className="text-base font-bold text-slate-900">Interface and uptime telemetry</h2>
-        <p className="mt-1 text-xs text-slate-500">Interface-specific values require supported SNMP counters and a configured interface index.</p>
-        <div className="mt-4 grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
           {[
-            ['Inbound throughput', formatBitRate(latestMetric.incomingThroughputBps)],
-            ['Outbound throughput', formatBitRate(latestMetric.outgoingThroughputBps)],
-            ['Device uptime', latestDerived.deviceUptimeSeconds == null ? 'Unavailable' : `${(latestDerived.deviceUptimeSeconds / 3600).toFixed(1)} hours`],
-            ['Interface', latestMetric.interfaceId || 'Unavailable'],
-            ['Inbound errors', latestDerived.inboundInterfaceErrors ?? 'Unavailable'],
-            ['Outbound errors', latestDerived.outboundInterfaceErrors ?? 'Unavailable'],
-            ['Inbound drops', latestDerived.inboundDroppedPackets ?? 'Unavailable'],
-            ['Outbound drops', latestDerived.outboundDroppedPackets ?? 'Unavailable'],
-            ['Inbound utilization', latestDerived.inboundInterfaceUtilizationPercent == null ? 'Unavailable' : `${latestDerived.inboundInterfaceUtilizationPercent.toFixed(2)}%`],
-            ['Outbound utilization', latestDerived.outboundInterfaceUtilizationPercent == null ? 'Unavailable' : `${latestDerived.outboundInterfaceUtilizationPercent.toFixed(2)}%`],
-          ].map(([label, value]) => (
-            <div key={label} className="rounded-xl bg-slate-50 p-3">
-              <p className="break-words text-[10px] font-semibold uppercase text-slate-400">{label}</p>
-              <p className="mt-1 break-words font-mono text-xs font-bold text-slate-800">{value}</p>
+            {
+              name: 'Availability Score',
+              score: health.availabilityScore ?? (isUp ? 100 : (isDown ? 0 : null)),
+              metric: 'Reachability & Uptime',
+              status: isDown ? 'Critical' : isUp ? 'Healthy' : 'Unknown',
+            },
+            {
+              name: 'Network Performance',
+              score: health.performanceScore ?? (latestMetric.latency !== null ? Math.max(0, 100 - (latestMetric.latency || 0) * 0.5 - (latestMetric.packetLoss || 0) * 2) : null),
+              metric: `RTT ${latestMetric.latency ?? '—'}ms · Loss ${latestMetric.packetLoss ?? '—'}%`,
+              status: latestMetric.latency !== null ? (latestMetric.latency < 100 ? 'Healthy' : 'Degraded') : 'Excluded',
+            },
+            {
+              name: 'Traffic Health',
+              score: health.trafficScore ?? null,
+              metric: latestMetric.incomingThroughputBps !== null ? formatBitRate(latestMetric.incomingThroughputBps) : 'SNMP IF-MIB needed',
+              status: health.trafficScore !== null ? (health.trafficScore >= 80 ? 'Healthy' : 'Warning') : 'Excluded',
+            },
+            {
+              name: 'Hardware Health',
+              score: health.hardwareScore ?? null,
+              metric: latestMetric.cpuUtilization !== null ? `CPU: ${latestMetric.cpuUtilization}% · RAM: ${latestMetric.memoryUtilization ?? '—'}%` : 'SNMP OIDs needed',
+              status: health.hardwareScore !== null ? (health.hardwareScore >= 80 ? 'Healthy' : 'Warning') : 'Excluded',
+            },
+          ].map((comp) => (
+            <div key={comp.name} className="rounded-xl bg-slate-50/80 p-3.5 border border-slate-200/80">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-slate-800">{comp.name}</span>
+                <span className="font-mono text-sm font-bold text-slate-900">
+                  {comp.score !== null ? `${Math.round(comp.score)}%` : '—'}
+                </span>
+              </div>
+              <p className="text-[11px] text-slate-500 mt-1">{comp.metric}</p>
+              <div className="mt-2.5 flex items-center justify-between text-[10px]">
+                <span className="text-slate-400 uppercase font-semibold">Status</span>
+                <span className={clsx(
+                  "font-bold uppercase px-1.5 py-0.2 rounded",
+                  comp.status === 'Healthy' ? "text-emerald-700 bg-emerald-50" :
+                  comp.status === 'Critical' ? "text-rose-700 bg-rose-50" :
+                  comp.status === 'Degraded' || comp.status === 'Warning' ? "text-amber-700 bg-amber-50" :
+                  "text-slate-500 bg-slate-200"
+                )}>
+                  {comp.status}
+                </span>
+              </div>
             </div>
           ))}
         </div>
       </section>
 
-      {/* Charts & Hardware Specs Grid */}
+      {/* Network Metrics Overview Strip */}
+      <div className="grid min-w-0 grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="glass-card-static rounded-2xl border border-slate-200 p-5">
+          <p className="text-xs font-bold uppercase tracking-wider text-slate-500">Latency Average</p>
+          <div className="mt-2 flex items-baseline gap-1.5">
+            <span className="font-mono text-2xl sm:text-3xl font-extrabold text-slate-900">
+              {latestMetric.latency == null ? 'Not collected' : `${latestMetric.latency}`}
+            </span>
+            {latestMetric.latency != null && <span className="text-xs font-semibold text-slate-500">ms</span>}
+          </div>
+          <p className="mt-2 text-xs text-slate-500">
+            {latestMetric.latency == null ? reasonForMetric('rtt', 'No successful ICMP round-trip sample') : `Min: ${latestMetric.rttMin ?? '—'} · Max: ${latestMetric.rttMax ?? '—'} ms`}
+          </p>
+        </div>
+
+        <div className="glass-card-static rounded-2xl border border-slate-200 p-5">
+          <p className="text-xs font-bold uppercase tracking-wider text-slate-500">Packet Loss Rate</p>
+          <div className="mt-2 flex items-baseline gap-1.5">
+            <span className="font-mono text-2xl sm:text-3xl font-extrabold text-slate-900">
+              {latestMetric.packetLoss == null ? 'Not collected' : `${latestMetric.packetLoss}`}
+            </span>
+            {latestMetric.packetLoss != null && <span className="text-xs font-semibold text-slate-500">%</span>}
+          </div>
+          <p className="mt-2 text-xs text-slate-500">
+            {latestMetric.packetLoss == null ? reasonForMetric('packetLoss', 'No valid packet-loss measurement') : `Availability: ${latestMetric.availability ?? '—'}%`}
+          </p>
+        </div>
+
+        <div className="glass-card-static rounded-2xl border border-slate-200 p-5">
+          <p className="text-xs font-bold uppercase tracking-wider text-slate-500">Inbound Throughput</p>
+          <div className="mt-2 flex items-baseline gap-1.5">
+            <span className="font-mono text-xl sm:text-2xl font-extrabold text-slate-900 truncate">
+              {formatBitRate(latestMetric.incomingThroughputBps)}
+            </span>
+          </div>
+          <p className="mt-2 break-words text-xs text-slate-500">
+            Source: {latestMetric.source || 'No interface collector'} · {latestMetric.interfaceId || 'Interface not configured'}
+            {latestMetric.incomingThroughputBps == null ? ` — ${reasonForMetric('inboundThroughput', 'Waiting for two interface counter samples')}` : ''}
+          </p>
+        </div>
+
+        <div className="glass-card-static rounded-2xl border border-slate-200 p-5">
+          <p className="text-xs font-bold uppercase tracking-wider text-slate-500">Outbound Throughput</p>
+          <div className="mt-2 flex items-baseline gap-1.5">
+            <span className="font-mono text-xl sm:text-2xl font-extrabold text-slate-900 truncate">
+              {formatBitRate(latestMetric.outgoingThroughputBps)}
+            </span>
+          </div>
+          <p className="mt-2 break-words text-xs text-slate-500">
+            Source: {latestMetric.source || 'No interface collector'}
+            {latestMetric.outgoingThroughputBps == null ? ` — ${reasonForMetric('outboundThroughput', 'Waiting for two interface counter samples')}` : ' · Rate from byte-counter deltas'}
+          </p>
+        </div>
+      </div>
+
+      {/* Hardware telemetry section */}
+      <section className="glass-card-static rounded-2xl border border-slate-200 p-5 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-100 pb-3">
+          <div>
+            <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
+              <Cpu className="w-4 h-4 text-sky-600" />
+              Hardware Telemetry (SNMP MIBs)
+            </h2>
+            <p className="text-xs text-slate-500">
+              Values are shown only when collected; simulated values and unsupported collectors are identified.
+            </p>
+          </div>
+          <span className="text-xs font-mono text-slate-500">
+            Source: {latestMetric.measurementSource === 'simulated' ? 'Simulation' : latestMetric.snmp?.responded ? 'SNMP Agent' : 'No agent telemetry'}
+          </span>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          {/* CPU Card */}
+          <div className="rounded-xl border border-slate-200 p-4 bg-slate-50/50 space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold text-slate-700">CPU Utilization</span>
+              <Cpu className="w-4 h-4 text-sky-600" />
+            </div>
+            <div className="flex items-baseline gap-1">
+              <span className="font-mono text-2xl font-extrabold text-slate-900">
+                {latestMetric.cpuUtilization != null ? `${latestMetric.cpuUtilization}%` : 'Not collected'}
+              </span>
+            </div>
+            {latestMetric.cpuUtilization != null && (
+              <div className="w-full bg-slate-200 rounded-full h-1.5 overflow-hidden">
+                <div 
+                  className={clsx(
+                    "h-full rounded-full transition-all",
+                    latestMetric.cpuUtilization > 85 ? "bg-rose-500" :
+                    latestMetric.cpuUtilization > 70 ? "bg-amber-500" : "bg-emerald-500"
+                  )}
+                  style={{ width: `${Math.min(100, latestMetric.cpuUtilization)}%` }}
+                />
+              </div>
+            )}
+            <p className="text-[10px] text-slate-500">
+              {hardware.cpu?.reason || (latestMetric.cpuUtilization !== null ? `Collected via ${hardware.cpu?.source || 'SNMP'}` : 'Requires supported CPU OID')}
+            </p>
+          </div>
+
+          {/* Memory Card */}
+          <div className="rounded-xl border border-slate-200 p-4 bg-slate-50/50 space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold text-slate-700">Memory Utilization</span>
+              <HardDrive className="w-4 h-4 text-emerald-600" />
+            </div>
+            <div className="flex items-baseline gap-1">
+              <span className="font-mono text-2xl font-extrabold text-slate-900">
+                {latestMetric.memoryUtilization != null ? `${latestMetric.memoryUtilization}%` : 'Not collected'}
+              </span>
+            </div>
+            {latestMetric.memoryUtilization != null && (
+              <div className="w-full bg-slate-200 rounded-full h-1.5 overflow-hidden">
+                <div 
+                  className={clsx(
+                    "h-full rounded-full transition-all",
+                    latestMetric.memoryUtilization > 85 ? "bg-rose-500" :
+                    latestMetric.memoryUtilization > 75 ? "bg-amber-500" : "bg-emerald-500"
+                  )}
+                  style={{ width: `${Math.min(100, latestMetric.memoryUtilization)}%` }}
+                />
+              </div>
+            )}
+            <p className="text-[10px] text-slate-500">
+              {hardware.memory?.totalBytes ? `Total: ${formatBytes(hardware.memory.totalBytes)}` : (hardware.memory?.reason || 'Requires supported memory OID')}
+            </p>
+          </div>
+
+          {/* Temperature Card */}
+          <div className="rounded-xl border border-slate-200 p-4 bg-slate-50/50 space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold text-slate-700">Device Temperature</span>
+              <Thermometer className="w-4 h-4 text-amber-600" />
+            </div>
+            <div className="flex items-baseline gap-1">
+              <span className="font-mono text-2xl font-extrabold text-slate-900">
+                {hardware.temperature?.celsius !== null && hardware.temperature?.celsius !== undefined 
+                  ? `${hardware.temperature.celsius}°C` 
+                  : 'Not collected'}
+              </span>
+            </div>
+            <p className="text-[10px] text-slate-500">
+              {hardware.temperature?.thresholdCelsius 
+                ? `Threshold: ${hardware.temperature.thresholdCelsius}°C` 
+                : (hardware.temperature?.reason || 'Requires environmental sensor OID')}
+            </p>
+          </div>
+
+          {/* System Uptime Card */}
+          <div className="rounded-xl border border-slate-200 p-4 bg-slate-50/50 space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold text-slate-700">System Uptime</span>
+              <Activity className="w-4 h-4 text-indigo-600" />
+            </div>
+            <div className="flex items-baseline gap-1">
+              <span className="font-mono text-xl font-extrabold text-slate-900">
+                {latestDerived.deviceUptimeSeconds != null 
+                  ? `${(latestDerived.deviceUptimeSeconds / 3600).toFixed(1)} hrs` 
+                  : 'Not collected'}
+              </span>
+            </div>
+            <p className="text-[10px] text-slate-500">
+              Source: {hardware.system?.sysUpTime != null
+                ? 'SNMPv2-MIB sysUpTime.0'
+                : latestMetric.measurementSource === 'simulated'
+                  ? 'SNMPv2-MIB sysUpTime.0 (not queried in simulation)'
+                  : 'SNMPv2-MIB sysUpTime.0 (not returned)'}
+            </p>
+          </div>
+        </div>
+      </section>
+
+      {/* Interface and Uptime Telemetry */}
+      <section className="glass-card-static rounded-2xl border border-slate-200 p-5">
+        <h2 className="text-base font-bold text-slate-900">Extended Interface Telemetry</h2>
+        <p className="mt-1 text-xs text-slate-500">Source: SNMP IF-MIB (or local host-interface RX/TX counters). Includes throughput, interface speed/status, and error counters.</p>
+        <div className="mt-4 grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          {[
+            ['Inbound throughput', formatBitRate(latestMetric.incomingThroughputBps)],
+            ['Outbound throughput', formatBitRate(latestMetric.outgoingThroughputBps)],
+            ['Device uptime', latestDerived.deviceUptimeSeconds == null ? (hardware.system?.sysUpTime == null ? 'Not collected — SNMP system group did not respond' : 'Not calculated') : `${(latestDerived.deviceUptimeSeconds / 3600).toFixed(1)} hours`],
+            ['Interface Index', latestMetric.snmp?.ifIndex || 'Not configured', null],
+            ['Interface speed', latestMetric.snmp?.interfaceSpeed == null ? 'Not reported' : formatBitRate(latestMetric.snmp.interfaceSpeed), reasonForMetric('interface_speed', 'IF-MIB ifSpeed/ifHighSpeed was not returned')],
+            ['Operational status', formatInterfaceStatus(latestMetric.snmp?.operationalStatus), reasonForMetric('interface_operational_status', 'IF-MIB ifOperStatus was not returned')],
+            ['Inbound errors', latestDerived.inboundInterfaceErrors ?? 'Not collected', reasonForMetric('inbound_interface_errors', 'Counter not returned by the interface')],
+            ['Outbound errors', latestDerived.outboundInterfaceErrors ?? 'Not collected', reasonForMetric('outbound_interface_errors', 'Counter not returned by the interface')],
+            ['Inbound discards', latestDerived.inboundDroppedPackets ?? 'Not collected', reasonForMetric('inbound_dropped_packets', 'Counter not returned by the interface')],
+            ['Outbound discards', latestDerived.outboundDroppedPackets ?? 'Not collected', reasonForMetric('outbound_dropped_packets', 'Counter not returned by the interface')],
+            ['Inbound utilization', latestDerived.inboundInterfaceUtilizationPercent == null ? 'Not calculated' : `${latestDerived.inboundInterfaceUtilizationPercent.toFixed(2)}%`, reasonForMetric('inboundThroughput', 'Requires measured throughput and reported interface speed')],
+            ['Outbound utilization', latestDerived.outboundInterfaceUtilizationPercent == null ? 'Not calculated' : `${latestDerived.outboundInterfaceUtilizationPercent.toFixed(2)}%`, reasonForMetric('outboundThroughput', 'Requires measured throughput and reported interface speed')],
+          ].map(([label, value, reason]) => (
+            <div key={label} className="rounded-xl bg-slate-50 p-3">
+              <p className="break-words text-[10px] font-semibold uppercase text-slate-400">{label}</p>
+              <p className="mt-1 break-words font-mono text-xs font-bold text-slate-800">{value}</p>
+              {reason && value !== 'Not configured' && value !== 'Not calculated' && (
+                <p className="mt-1 break-words text-[10px] text-slate-500">{reason}</p>
+              )}
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {/* Latency History Chart & Node Specifications */}
       <div className="grid min-w-0 grid-cols-1 gap-6 lg:grid-cols-2">
         
         {/* Latency History Chart */}
@@ -357,124 +719,197 @@ const DeviceDetails = () => {
           <div className="flex items-center justify-between">
             <div>
               <h2 className="text-base font-bold text-slate-900">Round-Trip Latency History</h2>
-              <p className="text-xs text-slate-500">Streamed ICMP ping latency data points</p>
+              <p className="text-xs text-slate-500">ICMP RTT trend; simulation data is identified in the collection banner</p>
             </div>
             <select
               value={range}
               onChange={(event) => setRange(event.target.value)}
-              className="text-xs font-mono font-bold text-sky-700 px-2 py-1 rounded bg-sky-50 border border-sky-200"
+              className="text-xs font-mono font-bold text-sky-700 px-2 py-1 rounded bg-sky-50 border border-sky-200 cursor-pointer"
               aria-label="Telemetry history range"
             >
               <option value="1h">1 hour</option>
               <option value="6h">6 hours</option>
               <option value="24h">24 hours</option>
               <option value="7d">7 days</option>
+              <option value="30d">30 days</option>
             </select>
           </div>
 
           <div className="h-72 min-w-0 w-full">
-            {chartData.some(point => point.latency !== null) ? <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={chartData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="colorLatDev" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#0284c7" stopOpacity={0.25} />
-                    <stop offset="90%" stopColor="#0284c7" stopOpacity={0.0} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false} />
-                <XAxis dataKey="time" stroke="#94a3b8" fontSize={10} tickLine={false} axisLine={false} minTickGap={32} interval="preserveStartEnd" />
-                <YAxis dataKey="latency" width={55} stroke="#94a3b8" fontSize={10} tickLine={false} axisLine={false} tickFormatter={v => `${v}ms`} />
-                <Tooltip 
-                  contentStyle={{ backgroundColor: '#ffffff', borderColor: '#e2e8f0', borderRadius: '0.75rem', fontSize: '12px', color: '#0f172a' }}
-                />
-                <Area type="monotone" dataKey="latency" connectNulls={false} stroke="#0284c7" strokeWidth={2.5} fillOpacity={1} fill="url(#colorLatDev)" />
-              </AreaChart>
-            </ResponsiveContainer> : (
+            {chartData.some(point => point.latency !== null) ? (
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={chartData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="colorLatDev" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor="#0284c7" stopOpacity={0.25} />
+                      <stop offset="90%" stopColor="#0284c7" stopOpacity={0.0} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false} />
+                  <XAxis dataKey="time" stroke="#94a3b8" fontSize={10} tickLine={false} axisLine={false} minTickGap={32} interval="preserveStartEnd" />
+                  <YAxis dataKey="latency" width={55} stroke="#94a3b8" fontSize={10} tickLine={false} axisLine={false} tickFormatter={v => `${v}ms`} />
+                  <Tooltip 
+                    contentStyle={{ backgroundColor: '#ffffff', borderColor: '#e2e8f0', borderRadius: '0.75rem', fontSize: '12px', color: '#0f172a' }}
+                  />
+                  <Area type="monotone" dataKey="latency" connectNulls={false} stroke="#0284c7" strokeWidth={2.5} fillOpacity={1} fill="url(#colorLatDev)" />
+                </AreaChart>
+              </ResponsiveContainer>
+            ) : (
               <div className="flex h-full items-center justify-center text-sm text-slate-500">
-                No latency observations in this time range.
+                No latency observations recorded in this time range.
               </div>
             )}
           </div>
         </div>
 
-        {/* Hardware & SNMP Metadata Card */}
+        {/* Node Specifications & Identity Card */}
         <div className="glass-card-static min-w-0 rounded-2xl p-6 border border-slate-200 flex flex-col justify-between">
           <div>
-            <h2 className="text-base font-bold text-slate-900 mb-1">Node Specifications</h2>
-            <p className="text-xs text-slate-500 mb-5">Hardware profile and monitoring metadata</p>
+            <h2 className="text-base font-bold text-slate-900 mb-1">Node Specifications & Identity</h2>
+            <p className="text-xs text-slate-500 mb-5">Hardware profile, protocol, and network identity</p>
 
-            <div className="space-y-4 text-xs">
-              <div className="flex min-w-0 items-center justify-between gap-3 pb-3 border-b border-slate-100">
+            <div className="space-y-3.5 text-xs">
+              <div className="flex min-w-0 items-center justify-between gap-3 pb-2.5 border-b border-slate-100">
                 <span className="text-slate-500">Node Architecture</span>
                 <span className="min-w-0 break-words text-right text-slate-900 font-bold capitalize flex items-center gap-1.5">
-                  {device.type === 'router' ? <Router className="w-3.5 h-3.5 text-sky-600" /> : <Server className="w-3.5 h-3.5 text-sky-600" />}
+                  {getDeviceIcon(device.type)}
                   {device.type}
                 </span>
               </div>
 
-              <div className="flex min-w-0 items-center justify-between gap-3 pb-3 border-b border-slate-100">
-                <span className="text-slate-500">Probe Protocol</span>
+              <div className="flex min-w-0 items-center justify-between gap-3 pb-2.5 border-b border-slate-100">
+                <span className="text-slate-500">MAC Address</span>
+                <span className="min-w-0 break-words text-right text-slate-900 font-mono font-bold">
+                  {device.macAddress || 'Not recorded'}
+                </span>
+              </div>
+
+              <div className="flex min-w-0 items-center justify-between gap-3 pb-2.5 border-b border-slate-100">
+                <span className="text-slate-500">Hardware Vendor</span>
+                <span className="min-w-0 break-words text-right text-blue-700 font-semibold">
+                  {device.vendor || 'Unknown'}
+                </span>
+              </div>
+
+              <div className="flex min-w-0 items-center justify-between gap-3 pb-2.5 border-b border-slate-100">
+                <span className="text-slate-500">Operating System</span>
+                <span className="min-w-0 break-words text-right text-slate-800 font-medium truncate max-w-xs" title={device.operatingSystem}>
+                  {device.operatingSystem || 'Unknown'}
+                </span>
+              </div>
+
+              <div className="flex min-w-0 items-center justify-between gap-3 pb-2.5 border-b border-slate-100">
+                <span className="text-slate-500">Monitoring Protocol</span>
                 <span className="min-w-0 break-words text-right text-sky-700 font-mono font-bold uppercase">{device.monitoringMethod || 'ICMP Ping'}</span>
               </div>
 
-              <div className="flex min-w-0 items-center justify-between gap-3 pb-3 border-b border-slate-100">
-                <span className="text-slate-500">SNMP Community</span>
-                <span className="min-w-0 break-words text-right text-slate-800 font-mono font-semibold">Protected on server</span>
-              </div>
-
-              <div className="flex min-w-0 items-center justify-between gap-3 pb-3 border-b border-slate-100">
-                <span className="text-slate-500">Rack / Facility</span>
-                <span className="min-w-0 break-words text-right text-slate-900 font-medium">{device.location || 'Location unavailable'}</span>
-              </div>
-
-              <div className="flex min-w-0 items-center justify-between gap-3 pb-3 border-b border-slate-100">
-                <span className="text-slate-500">Active Polling</span>
-                <span className="min-w-0 break-words text-right text-emerald-700 font-bold">{device.monitoringStatus ? 'Enabled' : 'Paused'}</span>
+              <div className="flex min-w-0 items-center justify-between gap-3 pb-2.5 border-b border-slate-100">
+                <span className="text-slate-500">SNMP Configuration</span>
+                <span className="min-w-0 break-words text-right text-slate-800 font-mono font-semibold">
+                  {device.snmpVersion ? `v${device.snmpVersion} (Protected)` : 'None'}
+                </span>
               </div>
 
               <div className="flex min-w-0 items-center justify-between gap-3">
-                <span className="text-slate-500">Last Reachable</span>
+                <span className="text-slate-500">Last Seen</span>
                 <span className="min-w-0 break-words text-right text-slate-800 font-mono">
                   {device.lastSeen ? formatTimestamp(device.lastSeen) : 'N/A'}
                 </span>
               </div>
             </div>
           </div>
-
         </div>
       </div>
 
-      <section className="glass-card-static w-full min-w-0 rounded-2xl border border-slate-200 p-5">
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <h2 className="text-base font-bold text-slate-900">Alert and incident history</h2>
-              <p className="text-xs text-slate-500">Most recent 100 incidents for this device</p>
+      {/* Metric Coverage Table */}
+      {metricCoverage && (
+        <section className="glass-card-static overflow-hidden rounded-2xl border border-slate-200">
+          <div className="border-b border-slate-100 p-5">
+            <div className="flex flex-wrap items-baseline justify-between gap-2">
+              <h2 className="text-sm font-bold text-slate-900">Collector Metric Coverage</h2>
+              <span className="font-mono text-lg font-bold text-sky-700">{metricCoverage.summary.coveragePercent}%</span>
             </div>
-            <span className="rounded-full bg-rose-50 px-2.5 py-1 text-xs font-bold text-rose-700">
-              {alerts.filter(alert => alert.status !== 'RESOLVED').length} active
-            </span>
+            <p className="mt-1 text-[11px] text-slate-500">
+              {metricCoverage.summary.successfullyCollectedMetrics} of {metricCoverage.summary.totalSupportedMetrics} supported metrics currently have fresh observations. Missing metrics remain null without being replaced by zero.
+            </p>
           </div>
-          {alerts.length === 0 ? (
-            <p className="mt-4 text-xs text-slate-500">No incidents recorded for the device.</p>
-          ) : (
-            <div className="mt-4 divide-y divide-slate-100">
-              {alerts.map(alert => (
-                <div key={alert._id} className="flex flex-col gap-1 py-3 sm:flex-row sm:items-center sm:justify-between">
-                  <div className="min-w-0 flex-1">
-                    <p className="break-words text-xs font-semibold text-slate-800">{alert.message}</p>
-                    <p className="text-[10px] text-slate-500">
-                      First: {format(new Date(alert.firstOccurredAt || alert.createdAt), 'MMM d, HH:mm:ss')}
-                      {alert.occurrenceCount > 1 ? ` · ${alert.occurrenceCount} occurrences` : ''}
-                    </p>
-                  </div>
-                  <div className="flex shrink-0 items-center gap-2 text-[10px] font-bold uppercase">
-                    <span className="text-rose-700">{alert.severity}</span>
-                    <span className={alert.status === 'RESOLVED' ? 'text-emerald-700' : 'text-amber-700'}>{alert.status}</span>
-                  </div>
+          <div className="max-h-96 overflow-auto">
+            <table className="w-full min-w-[640px] text-left text-xs">
+              <thead className="sticky top-0 bg-slate-50 text-[10px] uppercase tracking-wide text-slate-500">
+                <tr>
+                  <th className="px-4 py-2">Metric</th>
+                  <th className="px-4 py-2">Value</th>
+                  <th className="px-4 py-2">Source / Status</th>
+                  <th className="px-4 py-2">Last Collected / Reason</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {metricCoverage.metrics.map(metric => (
+                  <tr key={metric.id}>
+                    <td className="px-4 py-2 font-semibold text-slate-700">{metric.name}</td>
+                    <td className="px-4 py-2 font-mono text-slate-800">
+                      {metric.value === null ? '—' : `${metric.value}${metric.unit ? ` ${metric.unit}` : ''}`}
+                    </td>
+                    <td className="px-4 py-2">
+                      <span className={clsx(
+                        "font-semibold uppercase text-[10px] px-1.5 py-0.2 rounded",
+                        metric.status === 'AVAILABLE' ? "bg-emerald-50 text-emerald-700" :
+                        metric.status === 'STALE' ? "bg-amber-50 text-amber-700" :
+                        "bg-slate-100 text-slate-500"
+                      )}>{metric.status}</span>
+                      <span className="block text-[10px] text-slate-400 mt-0.5">{metric.source}</span>
+                    </td>
+                    <td className="px-4 py-2 text-slate-500 text-[11px]">
+                      {metric.reason || (metric.freshnessSeconds != null ? `${metric.freshnessSeconds}s ago` : '—')}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
+
+      {/* Incident & Alert History */}
+      <section className="glass-card-static w-full min-w-0 rounded-2xl border border-slate-200 p-5">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h2 className="text-base font-bold text-slate-900">Alert and Incident History</h2>
+            <p className="text-xs text-slate-500">Recorded hardware, availability, and performance events</p>
+          </div>
+          <span className="rounded-full bg-rose-50 px-2.5 py-1 text-xs font-bold text-rose-700">
+            {alerts.filter(alert => alert.status !== 'RESOLVED').length} active
+          </span>
+        </div>
+        {alerts.length === 0 ? (
+          <p className="mt-4 text-xs text-slate-500">No active or historical incidents recorded for this device.</p>
+        ) : (
+          <div className="mt-4 divide-y divide-slate-100">
+            {alerts.map(alert => (
+              <div key={alert._id} className="flex flex-col gap-1 py-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="min-w-0 flex-1">
+                  <p className="break-words text-xs font-semibold text-slate-800">{alert.message}</p>
+                  <p className="text-[10px] text-slate-500">
+                    First occurred: {format(new Date(alert.firstOccurredAt || alert.createdAt), 'MMM d, HH:mm:ss')}
+                    {alert.occurrenceCount > 1 ? ` · ${alert.occurrenceCount} occurrences` : ''}
+                  </p>
                 </div>
-              ))}
-            </div>
-          )}
+                <div className="flex shrink-0 items-center gap-2 text-[10px] font-bold uppercase">
+                  <span className={clsx(
+                    "px-2 py-0.5 rounded",
+                    alert.severity === 'CRITICAL' ? "bg-rose-100 text-rose-700" :
+                    alert.severity === 'HIGH' ? "bg-amber-100 text-amber-700" :
+                    "bg-slate-100 text-slate-700"
+                  )}>{alert.severity}</span>
+                  <span className={clsx(
+                    "px-2 py-0.5 rounded border",
+                    alert.status === 'RESOLVED' ? "text-emerald-700 bg-emerald-50 border-emerald-200" : "text-amber-700 bg-amber-50 border-amber-200"
+                  )}>{alert.status}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </section>
 
     </div>

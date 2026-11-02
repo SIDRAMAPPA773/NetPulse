@@ -61,14 +61,15 @@ const Header = ({ onToggleMobileMenu }) => {
       .catch(() => {});
 
     const socket = getSocket();
+    const handleNewAlert = (newAlert) => {
+      setAlerts(prev => [newAlert, ...prev].slice(0, 8));
+    };
     if (socket) {
-      socket.on('newAlert', (newAlert) => {
-        setAlerts(prev => [newAlert, ...prev].slice(0, 8));
-      });
+      socket.on('newAlert', handleNewAlert);
     }
 
     return () => {
-      if (socket) socket.off('newAlert');
+      if (socket) socket.off('newAlert', handleNewAlert);
     };
   }, []);
 

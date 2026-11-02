@@ -24,14 +24,15 @@ const Alerts = () => {
     fetchAlerts();
 
     const socket = getSocket();
+    const handleNewAlert = (alert) => {
+      setAlerts(prev => [alert, ...prev]);
+    };
     if (socket) {
-      socket.on('newAlert', (alert) => {
-        setAlerts(prev => [alert, ...prev]);
-      });
+      socket.on('newAlert', handleNewAlert);
     }
 
     return () => {
-      if (socket) socket.off('newAlert');
+      if (socket) socket.off('newAlert', handleNewAlert);
     };
   }, []);
 

@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { ReactFlow, Controls, Background, useNodesState, useEdgesState, MarkerType } from '@xyflow/react';
+import React, { useState, useEffect, useCallback } from 'react';
+import { ReactFlow, Controls, Background, Handle, Position, useNodesState, useEdgesState, MarkerType } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import api from '../services/api';
 import { useNavigate } from 'react-router-dom';
@@ -12,57 +12,60 @@ const CustomNode = ({ data }) => {
   const isDown = data.status === 'DOWN';
 
   return (
-    <div className={clsx(
-      "px-4 py-3 rounded-2xl bg-white border transition-all duration-300 min-w-[170px] shadow-sm text-left cursor-pointer group hover:shadow-md",
-      isInternet ? "border-indigo-300 hover:border-indigo-400" :
-      isUp ? "border-slate-300 hover:border-emerald-400" :
-      isDown ? "border-rose-300 hover:border-rose-400" :
-      "border-amber-300 hover:border-amber-400"
-    )}>
-      <div className="flex items-center justify-between gap-2 mb-2">
-        <div className={clsx(
-          "w-7 h-7 rounded-xl flex items-center justify-center border",
-          isInternet ? "bg-indigo-50 text-indigo-600 border-indigo-200" :
-          data.type === 'router' ? "bg-sky-50 text-sky-600 border-sky-200" :
-          data.type === 'server' ? "bg-purple-50 text-purple-600 border-purple-200" :
-          "bg-blue-50 text-blue-600 border-blue-200"
-        )}>
-          {isInternet ? <Globe className="w-4 h-4" /> :
-           data.type === 'router' ? <Router className="w-4 h-4" /> :
-           data.type === 'server' ? <Server className="w-4 h-4" /> :
-           <Wifi className="w-4 h-4" />}
-        </div>
-
-        {/* Live indicator dot */}
-        <span className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider font-mono">
-          <span className={clsx(
-            "w-2 h-2 rounded-full",
-            isUp ? "bg-emerald-500 animate-pulse" :
-            isDown ? "bg-rose-500 animate-pulse" :
-            "bg-amber-500"
-          )} />
-          <span className={clsx(
-            isUp ? "text-emerald-700" : isDown ? "text-rose-700" : "text-amber-700"
+    <>
+      <Handle type="target" position={Position.Top} />
+      <div className={clsx(
+        "px-4 py-3 rounded-2xl bg-white border transition-all duration-300 min-w-[170px] shadow-sm text-left cursor-pointer group hover:shadow-md",
+        isInternet ? "border-indigo-300 hover:border-indigo-400" :
+        isUp ? "border-slate-300 hover:border-emerald-400" :
+        isDown ? "border-rose-300 hover:border-rose-400" :
+        "border-amber-300 hover:border-amber-400"
+      )}>
+        <div className="flex items-center justify-between gap-2 mb-2">
+          <div className={clsx(
+            "w-7 h-7 rounded-xl flex items-center justify-center border",
+            isInternet ? "bg-indigo-50 text-indigo-600 border-indigo-200" :
+            data.type === 'router' ? "bg-sky-50 text-sky-600 border-sky-200" :
+            data.type === 'server' ? "bg-purple-50 text-purple-600 border-purple-200" :
+            "bg-blue-50 text-blue-600 border-blue-200"
           )}>
-            {data.status}
+            {isInternet ? <Globe className="w-4 h-4" /> :
+             data.type === 'router' ? <Router className="w-4 h-4" /> :
+             data.type === 'server' ? <Server className="w-4 h-4" /> :
+             <Wifi className="w-4 h-4" />}
+          </div>
+
+          <span className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider font-mono">
+            <span className={clsx(
+              "w-2 h-2 rounded-full",
+              isUp ? "bg-emerald-500 animate-pulse" :
+              isDown ? "bg-rose-500 animate-pulse" :
+              "bg-amber-500"
+            )} />
+            <span className={clsx(
+              isUp ? "text-emerald-700" : isDown ? "text-rose-700" : "text-amber-700"
+            )}>
+              {data.status}
+            </span>
           </span>
-        </span>
-      </div>
-
-      <div className="font-bold text-slate-900 text-xs truncate group-hover:text-sky-600 transition-colors">
-        {data.label}
-      </div>
-      <div className="text-[10px] text-slate-500 font-mono mt-0.5 tracking-tight font-medium">
-        {data.ip}
-      </div>
-
-      {!isInternet && (
-        <div className="mt-2 pt-2 border-t border-slate-100 text-[9px] text-slate-500 flex items-center justify-between font-mono">
-          <span>{data.location || 'Rack Node'}</span>
-          <ArrowUpRight className="w-3 h-3 text-slate-400 group-hover:text-sky-600 transition-colors" />
         </div>
-      )}
-    </div>
+
+        <div className="font-bold text-slate-900 text-xs truncate group-hover:text-sky-600 transition-colors">
+          {data.label}
+        </div>
+        <div className="text-[10px] text-slate-500 font-mono mt-0.5 tracking-tight font-medium">
+          {data.ip}
+        </div>
+
+        {!isInternet && (
+          <div className="mt-2 pt-2 border-t border-slate-100 text-[9px] text-slate-500 flex items-center justify-between font-mono">
+            <span>{data.location || 'Rack Node'}</span>
+            <ArrowUpRight className="w-3 h-3 text-slate-400 group-hover:text-sky-600 transition-colors" />
+          </div>
+        )}
+      </div>
+      <Handle type="source" position={Position.Bottom} />
+    </>
   );
 };
 
@@ -74,11 +77,7 @@ const NetworkMap = () => {
   const [devicesCount, setDevicesCount] = useState(0);
   const navigate = useNavigate();
 
-  useEffect(() => {
-    fetchTopology();
-  }, []);
-
-  const fetchTopology = async () => {
+  const fetchTopology = useCallback(async () => {
     try {
       const res = await api.get('/devices');
       const devices = res.data;
@@ -167,7 +166,11 @@ const NetworkMap = () => {
     } catch (error) {
       console.error('Failed to load topology', error);
     }
-  };
+  }, [navigate, setEdges, setNodes]);
+
+  useEffect(() => {
+    fetchTopology();
+  }, [fetchTopology]);
 
   const onNodeClick = (event, node) => {
     if (node.data.id && node.data.id !== 'internet') {

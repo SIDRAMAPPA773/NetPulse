@@ -42,40 +42,42 @@ const Performance = () => {
       });
 
     const socket = getSocket();
+    const handleDeviceUpdated = (updatedDevice) => {
+      setDevices(previous => previous.map(device => device._id === updatedDevice._id
+        ? { ...device, ...updatedDevice }
+        : device));
+    };
+    const handleMetricAdded = (metric) => {
+      const deviceId = getDeviceId(metric.device);
+      setDevices(previous => previous.map(device => device._id === deviceId ? {
+        ...device,
+        latestMetric: metric,
+        collectionStatus: metric.collectionStatus || 'unknown',
+        collectionReason: metric.reasonUnavailable || null,
+      } : device));
+      if (selectedDeviceId && selectedDeviceId !== deviceId) return;
+      const cutoff = Date.now() - ({
+        '1h': 60 * 60 * 1000,
+        '6h': 6 * 60 * 60 * 1000,
+        '24h': 24 * 60 * 60 * 1000,
+        '7d': 7 * 24 * 60 * 60 * 1000,
+      }[range]);
+      if (new Date(metric.createdAt).getTime() < cutoff) return;
+      setSamples(previous => [
+        ...previous.filter(sample => sample._id !== metric._id),
+        metric,
+      ].sort((left, right) => new Date(left.createdAt) - new Date(right.createdAt)).slice(-500));
+    };
     if (socket) {
-      socket.on('deviceUpdated', updatedDevice => {
-        setDevices(previous => previous.map(device => device._id === updatedDevice._id
-          ? { ...device, ...updatedDevice }
-          : device));
-      });
-      socket.on('metricAdded', metric => {
-        const deviceId = getDeviceId(metric.device);
-        setDevices(previous => previous.map(device => device._id === deviceId ? {
-          ...device,
-          latestMetric: metric,
-          collectionStatus: metric.collectionStatus || 'unknown',
-          collectionReason: metric.reasonUnavailable || null,
-        } : device));
-        if (selectedDeviceId && selectedDeviceId !== deviceId) return;
-        const cutoff = Date.now() - ({
-          '1h': 60 * 60 * 1000,
-          '6h': 6 * 60 * 60 * 1000,
-          '24h': 24 * 60 * 60 * 1000,
-          '7d': 7 * 24 * 60 * 60 * 1000,
-        }[range]);
-        if (new Date(metric.createdAt).getTime() < cutoff) return;
-        setSamples(previous => [
-          ...previous.filter(sample => sample._id !== metric._id),
-          metric,
-        ].sort((left, right) => new Date(left.createdAt) - new Date(right.createdAt)).slice(-500));
-      });
+      socket.on('deviceUpdated', handleDeviceUpdated);
+      socket.on('metricAdded', handleMetricAdded);
     }
 
     return () => {
       active = false;
       if (socket) {
-        socket.off('deviceUpdated');
-        socket.off('metricAdded');
+        socket.off('deviceUpdated', handleDeviceUpdated);
+        socket.off('metricAdded', handleMetricAdded);
       }
     };
   }, [range, selectedDeviceId]);

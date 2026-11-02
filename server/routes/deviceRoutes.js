@@ -1,14 +1,19 @@
 const express = require('express');
 const { 
   getDevices, 
+  getNetworkInterfaces,
+  synchronizeNetworkInterfaces,
   getDeviceById, 
   createDevice, 
   updateDevice, 
   deleteDevice,
   discoverLocalDevices,
+  cancelDiscovery,
+  getDiscoveryJobs,
   enrollMultipleDevices
 } = require('../controllers/deviceController');
 const { getDeviceMetrics } = require('../controllers/metricController');
+const { testTelemetry } = require('../controllers/telemetryController');
 const { protect, admin } = require('../middleware/auth');
 
 const router = express.Router();
@@ -18,6 +23,11 @@ router.route('/')
   .post(protect, admin, createDevice);
 
 // Network Auto-Discovery routes (placed before /:id)
+router.get('/network-interfaces', protect, admin, getNetworkInterfaces);
+router.post('/network-interfaces/synchronize', protect, admin, synchronizeNetworkInterfaces);
+router.get('/discovery/jobs', protect, admin, getDiscoveryJobs);
+router.post('/discovery/jobs/:id/cancel', protect, admin, cancelDiscovery);
+router.post('/:id/telemetry/test', protect, admin, testTelemetry);
 router.post('/discover', protect, admin, discoverLocalDevices);
 router.post('/enroll-multiple', protect, admin, enrollMultipleDevices);
 

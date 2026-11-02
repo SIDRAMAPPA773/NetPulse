@@ -13,6 +13,7 @@ import Traffic from './pages/Traffic';
 import Alerts from './pages/Alerts';
 import Reports from './pages/Reports';
 import Settings from './pages/Settings';
+import Subnets from './pages/Subnets';
 
 const App = () => {
   return (
@@ -23,6 +24,7 @@ const App = () => {
           <Route path="/" element={<MainLayout />}>
             <Route index element={<Dashboard />} />
             <Route path="devices" element={<Devices />} />
+            <Route path="subnets" element={<Subnets />} />
             <Route path="devices/:id" element={<DeviceDetails />} />
             <Route path="network-map" element={<NetworkMap />} />
             <Route path="performance" element={<Performance />} />

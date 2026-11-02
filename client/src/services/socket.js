@@ -15,7 +15,7 @@ export const connectSocket = () => {
 };
 
 export const getSocket = () => {
-  return socket;
+  return socket || connectSocket();
 };
 
 export const disconnectSocket = () => {

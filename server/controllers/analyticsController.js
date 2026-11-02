@@ -27,7 +27,7 @@ const getPerformance = async (req, res) => {
       }
       deviceFilter._id = device;
     }
-    if (type && !['router', 'switch', 'server', 'pc', 'other'].includes(type)) {
+    if (type && !['router', 'switch', 'server', 'pc', 'printer', 'ap', 'other'].includes(type)) {
       return res.status(400).json({ message: 'Invalid device type' });
     }
     if (location) deviceFilter.location = location;

@@ -3,6 +3,7 @@ const Device = require('../models/Device');
 const mongoose = require('mongoose');
 const { getAll, getByCat } = require('../config/metricsRegistry');
 const Setting = require('../models/Setting');
+const { createMetricCoverage, summarizeMetricCoverage } = require('../utils/metricCoverage');
 
 const getMetricRegistry = (req, res) => {
   const category = req.query.category;
@@ -11,6 +12,62 @@ const getMetricRegistry = (req, res) => {
     return res.status(400).json({ message: 'Unknown metric category' });
   }
   res.json({ count: metrics.length, metrics });
+};
+
+const getMetricCoverage = async (req, res) => {
+  try {
+    const requestedDeviceId = req.query.device;
+    if (requestedDeviceId && !mongoose.Types.ObjectId.isValid(requestedDeviceId)) {
+      return res.status(400).json({ message: 'Invalid device ID' });
+    }
+
+    const deviceFilter = requestedDeviceId ? { _id: requestedDeviceId } : {};
+    const devices = await Device.find(deviceFilter)
+      .select('_id name ipAddress monitoringMethod pollingInterval')
+      .limit(500)
+      .lean();
+    const deviceIds = devices.map((device) => device._id);
+    const latestMetrics = deviceIds.length
+      ? await Metric.aggregate([
+        { $match: { device: { $in: deviceIds } } },
+        { $sort: { createdAt: -1 } },
+        { $group: { _id: '$device', latestMetric: { $first: '$$ROOT' } } },
+      ])
+      : [];
+    const latestByDevice = new Map(latestMetrics.map((row) => [String(row._id), row.latestMetric]));
+    const deviceCoverage = devices.map((device) => {
+      const coverage = createMetricCoverage(device, latestByDevice.get(String(device._id)) || null, getAll());
+      return {
+        deviceId: String(device._id),
+        name: device.name,
+        ipAddress: device.ipAddress,
+        ...coverage,
+      };
+    });
+
+    if (requestedDeviceId) {
+      const [device] = deviceCoverage;
+      if (!device) return res.status(404).json({ message: 'Device not found' });
+      return res.json(device);
+    }
+
+    const summary = summarizeMetricCoverage(deviceCoverage.flatMap((device) => (
+      device.metrics.map((metric) => ({ status: metric.status }))
+    )));
+    res.json({
+      ...summary,
+      deviceCount: deviceCoverage.length,
+      devices: deviceCoverage.map(({ deviceId, name, ipAddress, summary: deviceSummary }) => ({
+        deviceId,
+        name,
+        ipAddress,
+        ...deviceSummary,
+      })),
+    });
+  } catch (error) {
+    console.error('Metric coverage query failed:', error);
+    res.status(500).json({ message: 'Unable to load metric coverage' });
+  }
 };
 
 const getDeviceMetrics = async (req, res) => {
@@ -63,7 +120,9 @@ const getDashboardSummary = async (req, res) => {
           _id: "$device",
           latency: { $first: "$latency" },
           packetLoss: { $first: "$packetLoss" },
-          status: { $first: "$status" }
+          status: { $first: "$status" },
+          cpuUtilization: { $first: "$hardware.cpu.utilization" },
+          memoryUtilization: { $first: "$hardware.memory.utilization" }
         }
       }
     ]);
@@ -72,6 +131,10 @@ const getDashboardSummary = async (req, res) => {
     let totalPacketLoss = 0;
     let validLatencyCount = 0;
     let validPacketLossCount = 0;
+    let totalCpu = 0;
+    let totalMemory = 0;
+    let validCpuCount = 0;
+    let validMemoryCount = 0;
     
     latestMetrics.forEach(m => {
       if (m.latency !== null && m.latency !== undefined) {
@@ -82,10 +145,20 @@ const getDashboardSummary = async (req, res) => {
         totalPacketLoss += m.packetLoss;
         validPacketLossCount++;
       }
+      if (m.cpuUtilization !== null && m.cpuUtilization !== undefined) {
+        totalCpu += m.cpuUtilization;
+        validCpuCount++;
+      }
+      if (m.memoryUtilization !== null && m.memoryUtilization !== undefined) {
+        totalMemory += m.memoryUtilization;
+        validMemoryCount++;
+      }
     });
 
     const avgLatency = validLatencyCount > 0 ? Number((totalLatency / validLatencyCount).toFixed(2)) : null;
     const avgPacketLoss = validPacketLossCount > 0 ? Number((totalPacketLoss / validPacketLossCount).toFixed(2)) : null;
+    const avgCpu = validCpuCount > 0 ? Number((totalCpu / validCpuCount).toFixed(1)) : null;
+    const avgMemory = validMemoryCount > 0 ? Number((totalMemory / validMemoryCount).toFixed(1)) : null;
 
     res.json({
       totalDevices,
@@ -97,6 +170,8 @@ const getDashboardSummary = async (req, res) => {
       reachableDevices: onlineDevices + warningDevices,
       avgLatency,
       avgPacketLoss,
+      avgCpu,
+      avgMemory,
       measurementSource,
     });
   } catch (error) {
@@ -104,4 +179,4 @@ const getDashboardSummary = async (req, res) => {
   }
 };
 
-module.exports = { getDeviceMetrics, getDashboardSummary, getMetricRegistry };
+module.exports = { getDeviceMetrics, getDashboardSummary, getMetricRegistry, getMetricCoverage };

@@ -46,6 +46,8 @@ test('availability and rates reject missing, reset, and invalid samples', () => 
 test('counter deltas distinguish normal increments, rollovers, and resets', () => {
   assert.equal(computeCounterDelta(100, 150, 2), 50);
   assert.equal(computeCounterDelta(0xFFFFFFF0, 0x10, 2, 32), 32);
+  assert.equal(computeCounterDelta('18446744073709551600', '10', 2, 64), 26);
+  assert.equal(computeCounterDelta('9007199254741000', '9007199254741100', 2, 64), 100);
   assert.equal(computeCounterDelta(500, 10, 2, 32), null);
   assert.equal(computeCounterDelta(10, 20, 0), null);
 });

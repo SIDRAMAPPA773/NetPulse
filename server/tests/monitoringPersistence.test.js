@@ -3,8 +3,10 @@ const assert = require('node:assert/strict');
 const Metric = require('../models/Metric');
 const Alert = require('../models/Alert');
 const Setting = require('../models/Setting');
+const Subnet = require('../models/Subnet');
 const socketService = require('../services/socketService');
 const icmpProbe = require('../utils/icmpProbe');
+const snmp = require('net-snmp');
 
 const originalMetricCreate = Metric.create;
 const originalAlertUpdateMany = Alert.updateMany;
@@ -12,8 +14,10 @@ const originalAlertFindOne = Alert.findOne;
 const originalAlertCreate = Alert.create;
 const originalAlertFindById = Alert.findById;
 const originalSettingFind = Setting.find;
+const originalSubnetFind = Subnet.find;
 const originalGetIO = socketService.getIO;
 const originalProbeIcmp = icmpProbe.probeIcmp;
+const originalCreateSnmpSession = snmp.createSession;
 const originalAllowlist = process.env.MONITORING_TARGET_ALLOWLIST;
 const emissions = [];
 const persistedMetrics = [];
@@ -41,8 +45,10 @@ after(() => {
   Alert.create = originalAlertCreate;
   Alert.findById = originalAlertFindById;
   Setting.find = originalSettingFind;
+  Subnet.find = originalSubnetFind;
   socketService.getIO = originalGetIO;
   icmpProbe.probeIcmp = originalProbeIcmp;
+  snmp.createSession = originalCreateSnmpSession;
   if (originalAllowlist === undefined) delete process.env.MONITORING_TARGET_ALLOWLIST;
   else process.env.MONITORING_TARGET_ALLOWLIST = originalAllowlist;
 });
@@ -60,6 +66,15 @@ Setting.find = async () => [
   { key: 'SIMULATION_MODE', value: false },
   { key: 'EMERGENCY_STOP', value: false },
 ];
+Subnet.find = () => ({
+  lean: async () => [{
+    _id: 'subnet-test',
+    cidr: '10.38.27.0/24',
+    status: 'active',
+    approvalStatus: 'approved',
+    monitoringEnabled: true,
+  }],
+});
 socketService.getIO = () => ({ emit: (...args) => emissions.push(args) });
 icmpProbe.probeIcmp = async () => {
   probeCount += 1;
@@ -85,7 +100,7 @@ test('real authorized ICMP results are persisted with measured values and timest
 
   await processDevice(device, { acquire: async () => {} });
 
-  const saved = persistedMetrics.at(-1);
+  const saved = persistedMetrics.filter((metric) => metric.device === device._id).at(-1);
   assert.equal(probeCount, 1);
   assert.equal(saved.device, device._id);
   assert.equal(saved.status, 'UP');
@@ -188,7 +203,7 @@ test('unauthorized devices persist a reason without attempting ICMP', async () =
   assert.equal(probeCount, previousProbeCount);
   assert.equal(saved.collectionStatus, 'blocked');
   assert.equal(saved.availabilityStatus, 'unavailable');
-  assert.equal(saved.reasonUnavailable, 'Target is not in MONITORING_TARGET_ALLOWLIST');
+  assert.equal(saved.reasonUnavailable, 'Device is outside MONITORING_TARGET_ALLOWLIST; add its approved subnet CIDR during migration');
   assert.equal(saved.latency, undefined);
   assert.equal(saved.packetLoss, undefined);
 });
@@ -273,4 +288,119 @@ test('completed unanswered ICMP probes still report unreachable status', async (
   assert.equal(saved.collectionStatus, 'success');
   assert.equal(saved.availabilityStatus, 'available');
   assert.equal(saved.packetLoss, 100);
+});
+
+test('a configured SNMP response confirms reachability when ICMP is blocked', async () => {
+  process.env.MONITORING_TARGET_ALLOWLIST = '10.38.27.191';
+  await updateSettingsCache();
+  nextProbeResult = {
+    reachable: false,
+    rttAvg: null,
+    rttMin: null,
+    rttMax: null,
+    rttStddev: null,
+    packetLoss: 100,
+    availability: 0,
+    probeCount: 5,
+    probes: Array.from({ length: 5 }, () => ({ success: false, rttMs: null })),
+    error: null,
+  };
+  snmp.createSession = () => ({
+    get: (oids, callback) => callback(null, [{
+      oid: '1.3.6.1.2.1.1.3.0',
+      value: 12345,
+    }]),
+    close: () => {},
+  });
+  const device = {
+    _id: 'device-snmp-only',
+    name: 'SNMP-only device',
+    ipAddress: '10.38.27.191',
+    status: 'UNKNOWN',
+    monitoringMethod: 'snmp',
+    snmpCommunity: 'test-community',
+    snmpVersion: '2c',
+    save: async () => {},
+    toJSON() {
+      return { _id: this._id, ipAddress: this.ipAddress, status: this.status };
+    },
+  };
+
+  await processDevice(device, { acquire: async () => {} });
+
+  const saved = persistedMetrics.at(-1);
+  assert.equal(device.status, 'WARNING');
+  assert.equal(saved.status, 'WARNING');
+  assert.equal(saved.snmp.sysUpTime, 12345);
+  assert.equal(saved.snmp.responded, true);
+  assert.equal(saved.availabilityStatus, 'available');
+  assert.equal(saved.latency, null);
+  assert.equal(saved.packetLoss, 100);
+});
+
+test('SNMPv2 prefers exact high-capacity counters for rollover-safe interface rates', async () => {
+  process.env.MONITORING_TARGET_ALLOWLIST = '10.38.27.191';
+  await updateSettingsCache();
+  nextProbeResult = {
+    reachable: true,
+    rttAvg: 10,
+    rttMin: 10,
+    rttMax: 10,
+    rttStddev: 0,
+    packetLoss: 0,
+    availability: 100,
+    probeCount: 1,
+    probes: [{ success: true, rttMs: 10 }],
+  };
+  let sampleIndex = 0;
+  let requestedOids = [];
+  snmp.createSession = () => ({
+    get: (oids, callback) => {
+      requestedOids = oids;
+      const sample = sampleIndex;
+      sampleIndex += 1;
+      const counters = sample === 0
+        ? { in: 18446744073709551600n, out: 18446744073709551600n, packets: 1000n }
+        : { in: 10n, out: 10n, packets: 1020n };
+      callback(null, oids.map((oid) => {
+        const suffix = oid.slice(oid.lastIndexOf('.') + 1);
+        if (oid === '1.3.6.1.2.1.1.3.0') return { oid, value: 1000 };
+        if (oid === '1.3.6.1.2.1.2.2.1.2.2') return { oid, value: 'eth0' };
+        if (oid === `1.3.6.1.2.1.31.1.1.1.6.2`) return { oid, value: counters.in };
+        if (oid === `1.3.6.1.2.1.31.1.1.1.10.2`) return { oid, value: counters.out };
+        if (oid === `1.3.6.1.2.1.31.1.1.1.7.2`) return { oid, value: counters.packets };
+        if (oid === `1.3.6.1.2.1.31.1.1.1.11.2`) return { oid, value: counters.packets };
+        if (['14', '20', '13', '19', '5', '8'].includes(oid.split('.')[10])) {
+          return { oid, value: Number(suffix) + 1 };
+        }
+        return { oid, value: 0 };
+      }));
+    },
+    close: () => {},
+  });
+  const device = {
+    _id: 'device-hc-counters',
+    name: 'High capacity switch',
+    ipAddress: '10.38.27.191',
+    status: 'UNKNOWN',
+    monitoringMethod: 'snmp',
+    snmpCommunity: 'test-community',
+    snmpVersion: '2c',
+    snmpInterfaceIndex: 2,
+    save: async () => {},
+    toJSON() {
+      return { _id: this._id, ipAddress: this.ipAddress, status: this.status };
+    },
+  };
+
+  await processDevice(device, { acquire: async () => {} });
+  await new Promise(resolve => setTimeout(resolve, 5));
+  await processDevice(device, { acquire: async () => {} });
+
+  const saved = persistedMetrics.filter((metric) => metric.device === device._id).at(-1);
+  assert.ok(requestedOids.includes('1.3.6.1.2.1.31.1.1.1.6.2'));
+  assert.equal(saved.snmp.inOctetsHC, '10');
+  assert.equal(saved.snmp.outOctetsHC, '10');
+  assert.ok(saved.snmp.inBps > 0);
+  assert.ok(saved.snmp.outBps > 0);
 });

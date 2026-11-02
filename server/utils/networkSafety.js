@@ -1,6 +1,15 @@
-const { isValidIPv4, parseCidr, enumerateHosts } = require('./ipValidation');
+const {
+  isValidIPv4,
+  parseCidr,
+  enumerateHosts,
+  isPrivateIPv4Cidr,
+} = require('./ipValidation');
 
 const MAX_DISCOVERY_HOSTS = 256;
+const DISCOVERY_AUTHORIZATION_MODES = Object.freeze({
+  DUAL: 'dual',
+  SUBNET_REGISTRY: 'subnet_registry',
+});
 let emergencyStopActive = false;
 
 function parseAllowlist(value = '') {
@@ -10,18 +19,42 @@ function parseAllowlist(value = '') {
     .filter(Boolean);
 }
 
-function getApprovedDiscoveryHosts(cidr, allowlist, maxHosts = MAX_DISCOVERY_HOSTS) {
+function getDiscoveryAuthorizationMode(value) {
+  return Object.values(DISCOVERY_AUTHORIZATION_MODES).includes(value)
+    ? value
+    : DISCOVERY_AUTHORIZATION_MODES.DUAL;
+}
+
+function getApprovedDiscoveryHosts(
+  cidr,
+  allowlist,
+  maxHosts = MAX_DISCOVERY_HOSTS,
+  { requireAllowlist = true } = {},
+) {
   const parsed = parseCidr(cidr);
   if (!parsed || parsed.cidr !== cidr) {
     return { error: 'INVALID_CIDR' };
   }
-  if (!Array.isArray(allowlist) || !allowlist.includes(parsed.cidr)) {
+  if (!isPrivateIPv4Cidr(parsed.cidr)) {
+    return { error: 'UNSAFE_CIDR' };
+  }
+  if (requireAllowlist && (!Array.isArray(allowlist) || !allowlist.includes(parsed.cidr))) {
     return { error: 'NOT_ALLOWLISTED' };
   }
 
   const result = enumerateHosts(parsed.cidr, Math.min(maxHosts, MAX_DISCOVERY_HOSTS));
   if (!result || result.error) return { error: 'EXCEEDS_MAX', hostCount: parsed.hostCount };
   return { cidr: parsed.cidr, hosts: result.hosts };
+}
+
+function getApprovedSubnetDiscoveryHosts(subnet, allowlist, authorizationMode) {
+  if (!subnet || subnet.status !== 'active' || subnet.approvalStatus !== 'approved') {
+    return { error: 'SUBNET_NOT_APPROVED' };
+  }
+  return getApprovedDiscoveryHosts(subnet.cidr, allowlist, MAX_DISCOVERY_HOSTS, {
+    requireAllowlist: getDiscoveryAuthorizationMode(authorizationMode)
+      !== DISCOVERY_AUTHORIZATION_MODES.SUBNET_REGISTRY,
+  });
 }
 
 function isTargetAllowed(ip, allowlist) {
@@ -71,8 +104,11 @@ function isEmergencyStopActive() {
 
 module.exports = {
   MAX_DISCOVERY_HOSTS,
+  DISCOVERY_AUTHORIZATION_MODES,
   parseAllowlist,
+  getDiscoveryAuthorizationMode,
   getApprovedDiscoveryHosts,
+  getApprovedSubnetDiscoveryHosts,
   isTargetAllowed,
   createCooldownGuard,
   setEmergencyStop,

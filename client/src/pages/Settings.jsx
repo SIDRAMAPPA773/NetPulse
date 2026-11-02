@@ -1,12 +1,22 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useContext } from 'react';
 import api from '../services/api';
 import { Save, ShieldAlert, Zap, RotateCcw, Check } from 'lucide-react';
 import clsx from 'clsx';
+import { AuthContext } from '../context/AuthContext';
 
 const Settings = () => {
+  const { user } = useContext(AuthContext);
+  const isAdmin = user?.role === 'admin';
   const [settings, setSettings] = useState({
     SIMULATION_MODE: true,
     EMERGENCY_STOP: false,
+    DISCOVERY_AUTHORIZATION_MODE: 'dual',
+    NETWORK_AUTHORIZATION_POLICY: {
+      mode: 'legacy_allowlists',
+      autoAuthorizeInterfaces: false,
+      interfaceTypes: [],
+      maxHosts: 256
+    },
     LATENCY_WARNING: 100,
     LATENCY_CRITICAL: 250,
     PACKET_LOSS_WARNING: 5,
@@ -15,6 +25,9 @@ const Settings = () => {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
+  const [networkPolicyConfigured, setNetworkPolicyConfigured] = useState(false);
+  const [syncingNetworks, setSyncingNetworks] = useState(false);
+  const [networkSyncResult, setNetworkSyncResult] = useState(null);
 
   useEffect(() => {
     fetchSettings();
@@ -23,11 +36,25 @@ const Settings = () => {
   const fetchSettings = async () => {
     try {
       const res = await api.get('/settings');
+      setNetworkPolicyConfigured(Object.prototype.hasOwnProperty.call(res.data, 'NETWORK_AUTHORIZATION_POLICY'));
       setSettings(prev => ({
         ...prev,
         ...res.data,
         SIMULATION_MODE: Boolean(res.data.SIMULATION_MODE === true || res.data.SIMULATION_MODE === 'true'),
-        EMERGENCY_STOP: Boolean(res.data.EMERGENCY_STOP === true || res.data.EMERGENCY_STOP === 'true')
+        EMERGENCY_STOP: Boolean(res.data.EMERGENCY_STOP === true || res.data.EMERGENCY_STOP === 'true'),
+        DISCOVERY_AUTHORIZATION_MODE: res.data.DISCOVERY_AUTHORIZATION_MODE === 'subnet_registry'
+          ? 'subnet_registry'
+          : 'dual',
+        NETWORK_AUTHORIZATION_POLICY: {
+          mode: res.data.NETWORK_AUTHORIZATION_POLICY?.mode === 'application_managed'
+            ? 'application_managed'
+            : 'legacy_allowlists',
+          autoAuthorizeInterfaces: res.data.NETWORK_AUTHORIZATION_POLICY?.autoAuthorizeInterfaces === true,
+          interfaceTypes: Array.isArray(res.data.NETWORK_AUTHORIZATION_POLICY?.interfaceTypes)
+            ? res.data.NETWORK_AUTHORIZATION_POLICY.interfaceTypes
+            : [],
+          maxHosts: Number(res.data.NETWORK_AUTHORIZATION_POLICY?.maxHosts) || 256,
+        },
       }));
     } catch (error) {
       console.error(error);
@@ -36,12 +63,39 @@ const Settings = () => {
     }
   };
 
+  const updateNetworkPolicy = (update) => {
+    setNetworkPolicyConfigured(true);
+    setSettings(prev => ({
+      ...prev,
+      NETWORK_AUTHORIZATION_POLICY: {
+        ...prev.NETWORK_AUTHORIZATION_POLICY,
+        ...update
+      }
+    }));
+  };
+
+  const handleSynchronizeNetworks = async () => {
+    setSyncingNetworks(true);
+    setNetworkSyncResult(null);
+    try {
+      const response = await api.post('/devices/network-interfaces/synchronize');
+      setNetworkSyncResult(response.data);
+    } catch (error) {
+      console.error(error);
+      setNetworkSyncResult({ error: error.response?.data?.message || 'Unable to synchronize connected networks' });
+    } finally {
+      setSyncingNetworks(false);
+    }
+  };
+
   const handleSave = async (e) => {
     e?.preventDefault();
     setSaving(true);
     setSaveSuccess(false);
     try {
-      await api.put('/settings', settings);
+      const updates = { ...settings };
+      if (!networkPolicyConfigured) delete updates.NETWORK_AUTHORIZATION_POLICY;
+      await api.put('/settings', updates);
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 3000);
     } catch (error) {
@@ -56,14 +110,22 @@ const Settings = () => {
     const { name, value, type, checked } = e.target;
     setSettings(prev => ({
       ...prev,
-      [name]: type === 'checkbox' ? checked : Number(value)
+      [name]: type === 'checkbox' ? checked : type === 'number' ? Number(value) : value
     }));
   };
 
   const handleResetDefaults = () => {
+    setNetworkPolicyConfigured(true);
     setSettings({
       SIMULATION_MODE: true,
       EMERGENCY_STOP: false,
+      DISCOVERY_AUTHORIZATION_MODE: 'dual',
+      NETWORK_AUTHORIZATION_POLICY: {
+        mode: 'legacy_allowlists',
+        autoAuthorizeInterfaces: false,
+        interfaceTypes: [],
+        maxHosts: 256
+      },
       LATENCY_WARNING: 100,
       LATENCY_CRITICAL: 250,
       PACKET_LOSS_WARNING: 5,
@@ -180,10 +242,126 @@ const Settings = () => {
                 </span>
               </div>
               <p className="text-xs text-slate-500 mt-1 leading-relaxed">
-                When enabled, the engine generates clearly labelled simulation observations and sends no network probes. Real ICMP/SNMP collection remains disabled unless the target is present in the server MONITORING_TARGET_ALLOWLIST; discovery uses its separate DISCOVERY_ALLOWLIST. CPU and memory are unavailable unless a supported OID or authorized agent is configured.
+                When enabled, the engine generates clearly labelled simulation observations and sends no network probes. Live monitoring and discovery require active, approved private subnet records. Legacy mode also requires the environment allowlists; application-managed mode replaces those static checks but never removes subnet, enrollment, interface-scope, rate, or emergency-stop controls.
               </p>
             </div>
           </label>
+        </div>
+      </div>
+
+      <div className="glass-card-static rounded-2xl border border-sky-200 bg-sky-50/60 overflow-hidden shadow-xs">
+        <div className="p-6 space-y-5">
+          <div>
+            <h2 className="text-sm font-bold text-slate-900">Network authorization policy</h2>
+            <p className="mt-1 text-xs leading-relaxed text-slate-600">
+              Application-managed mode uses active, approved subnet records instead of per-IP environment allowlists for both discovery and monitoring. Empty allowlists never grant access: a private subnet record, approved enrollment, and explicit device monitoring setting are still required.
+            </p>
+            {!networkPolicyConfigured && (
+              <p className="mt-2 text-xs text-amber-800">
+                The unified policy has not been saved yet. Existing discovery authorization settings remain in effect until an administrator selects and saves a mode.
+              </p>
+            )}
+          </div>
+          <label className="block max-w-xl text-xs font-semibold text-slate-700">
+            Authorization mode
+            <select
+              value={settings.NETWORK_AUTHORIZATION_POLICY.mode}
+              onChange={(e) => updateNetworkPolicy({
+                mode: e.target.value,
+                ...(e.target.value === 'legacy_allowlists' ? { autoAuthorizeInterfaces: false } : {})
+              })}
+              disabled={!isAdmin}
+              className="mt-2 block w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm disabled:bg-slate-100"
+            >
+              <option value="legacy_allowlists">Legacy: approved subnets + environment allowlists</option>
+              <option value="application_managed">Application-managed subnet authorization</option>
+            </select>
+          </label>
+          {settings.NETWORK_AUTHORIZATION_POLICY.mode === 'application_managed' && (
+            <div className="space-y-4 rounded-xl border border-sky-200 bg-white/80 p-4">
+              <label className="flex items-start gap-3 text-xs text-slate-700">
+                <input
+                  type="checkbox"
+                  checked={settings.NETWORK_AUTHORIZATION_POLICY.autoAuthorizeInterfaces}
+                  onChange={(e) => updateNetworkPolicy({ autoAuthorizeInterfaces: e.target.checked })}
+                  disabled={!isAdmin}
+                  className="mt-0.5 h-4 w-4 rounded border-slate-300 text-blue-600"
+                />
+                <span>
+                  <span className="font-bold">Automatically authorize eligible connected interfaces</span>
+                  <span className="mt-1 block text-slate-500">This registers only currently connected, in-scope RFC1918 networks. It never starts discovery or enables monitoring automatically.</span>
+                </span>
+              </label>
+              <div>
+                <p className="text-xs font-bold text-slate-700">Allowed interface types (explicit scope)</p>
+                <div className="mt-2 flex flex-wrap gap-3">
+                  {[
+                    ['wireless', 'Wi-Fi'],
+                    ['ethernet', 'Ethernet'],
+                    ['hotspot', 'Mobile hotspot'],
+                    ['virtual', 'Virtual / VPN (higher risk)']
+                  ].map(([value, label]) => (
+                    <label key={value} className="inline-flex items-center gap-2 text-xs text-slate-600">
+                      <input
+                        type="checkbox"
+                        checked={settings.NETWORK_AUTHORIZATION_POLICY.interfaceTypes.includes(value)}
+                        onChange={(e) => {
+                          const currentTypes = settings.NETWORK_AUTHORIZATION_POLICY.interfaceTypes;
+                          const nextTypes = e.target.checked
+                            ? [...currentTypes, value]
+                            : currentTypes.filter((type) => type !== value);
+                          updateNetworkPolicy({
+                            interfaceTypes: nextTypes,
+                            ...(nextTypes.length === 0 ? { autoAuthorizeInterfaces: false } : {})
+                          });
+                        }}
+                        disabled={!isAdmin}
+                        className="h-4 w-4 rounded border-slate-300 text-blue-600"
+                      />
+                      {label}
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <label className="block max-w-xs text-xs font-semibold text-slate-700">
+                Maximum usable hosts per interface network
+                <input
+                  type="number"
+                  min="1"
+                  max="256"
+                  value={settings.NETWORK_AUTHORIZATION_POLICY.maxHosts}
+                  onChange={(e) => updateNetworkPolicy({ maxHosts: Number(e.target.value) })}
+                  disabled={!isAdmin || !settings.NETWORK_AUTHORIZATION_POLICY.autoAuthorizeInterfaces}
+                  className="mt-2 block w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-sm disabled:bg-slate-100"
+                />
+                <span className="mt-1 block font-normal text-slate-500">Hard-capped at 256 hosts per subnet.</span>
+              </label>
+            </div>
+          )}
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              onClick={handleSynchronizeNetworks}
+              disabled={!isAdmin || syncingNetworks}
+              className="rounded-lg border border-sky-300 bg-white px-3 py-2 text-xs font-bold text-sky-800 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {syncingNetworks ? 'Synchronizing...' : 'Synchronize connected networks now'}
+            </button>
+            <span className="text-[11px] text-slate-500">Authorization sync only; does not probe or discover devices.</span>
+          </div>
+          {networkSyncResult && (
+            <p role="status" className={clsx(
+              'text-xs',
+              networkSyncResult.error || networkSyncResult.reason === 'application_managed_mode_disabled'
+                ? 'text-amber-800'
+                : 'text-emerald-700'
+            )}>
+              {networkSyncResult.error
+                || networkSyncResult.reason
+                || `Authorized ${networkSyncResult.authorized || 0}, refreshed ${networkSyncResult.refreshed || 0}, disconnected ${networkSyncResult.disconnected || 0}, skipped ${networkSyncResult.skippedInterfaces || 0}.`}
+            </p>
+          )}
+          {!isAdmin && <p className="text-xs text-slate-500">Only administrators can change policy or synchronize interface authorization.</p>}
         </div>
       </div>
 

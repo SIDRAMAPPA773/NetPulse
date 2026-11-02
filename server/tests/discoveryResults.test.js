@@ -13,7 +13,14 @@ test('discovery maps enrolled responders to stable device IDs and monitoring aut
     { _id: 'device-b', ipAddress: '10.38.27.191', monitoringStatus: false },
   ];
 
-  const results = mapDiscoveredDevices(discovered, existing, ['10.38.27.0/24']);
+  const subnets = [{
+    _id: 'subnet-id',
+    cidr: '10.38.27.0/24',
+    status: 'active',
+    approvalStatus: 'approved',
+    monitoringEnabled: true,
+  }];
+  const results = mapDiscoveredDevices(discovered, existing, ['10.38.27.0/24'], subnets);
 
   assert.deepEqual(results.map(({ isEnrolled, deviceId }) => [isEnrolled, deviceId]), [
     [true, 'device-a'],
@@ -22,7 +29,8 @@ test('discovery maps enrolled responders to stable device IDs and monitoring aut
   ]);
   assert.equal(results[0].monitoringAuthorized, true);
   assert.equal(results[1].monitoringStatus, false);
-  assert.equal(results[2].monitoringAuthorized, true);
+  assert.equal(results[2].monitoringAuthorized, false);
+  assert.equal(results[2].monitoringAuthorizationCode, 'NOT_ENROLLED');
 });
 
 test('discovery approval does not grant continuous monitoring authorization', () => {
@@ -30,9 +38,15 @@ test('discovery approval does not grant continuous monitoring authorization', ()
     [{ ipAddress: '10.38.27.142' }],
     [{ _id: 'device-a', ipAddress: '10.38.27.142', monitoringStatus: true }],
     [],
+    [{
+      cidr: '10.38.27.0/24',
+      status: 'active',
+      approvalStatus: 'approved',
+      monitoringEnabled: true,
+    }],
   );
 
   assert.equal(result.isEnrolled, true);
   assert.equal(result.monitoringAuthorized, false);
-  assert.equal(result.monitoringAuthorizationReason, 'Target is not in MONITORING_TARGET_ALLOWLIST');
+  assert.equal(result.monitoringAuthorizationCode, 'MIGRATION_ALLOWLIST_BLOCKED');
 });

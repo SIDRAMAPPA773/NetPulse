@@ -21,6 +21,7 @@ const Sidebar = ({ mobileOpen, setMobileOpen }) => {
       items: [
         { name: 'Live Overview', path: '/', icon: LayoutDashboard, badge: 'Live' },
         { name: 'Device Inventory', path: '/devices', icon: Server },
+        { name: 'Subnet Management', path: '/subnets', icon: Network },
         { name: 'Topology Map', path: '/network-map', icon: Network },
       ]
     },

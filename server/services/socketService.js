@@ -28,6 +28,7 @@ module.exports = {
     });
     
     io.on('connection', (socket) => {
+      if (socket.data.user.role === 'admin') socket.join('admins');
       console.log('Client connected');
       socket.on('disconnect', () => {
         console.log('Client disconnected');

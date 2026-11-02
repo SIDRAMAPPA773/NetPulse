@@ -24,6 +24,7 @@ function parseCidr(cidr) {
   const maskBits = mask === 32 ? 0xFFFFFFFF : ((0xFFFFFFFF << (32 - mask)) >>> 0);
   const networkNum = (ipNum & maskBits) >>> 0;
   const broadcastNum = (networkNum | (~maskBits >>> 0)) >>> 0;
+  const totalAddresses = 2 ** (32 - mask);
   const hostCount = mask >= 31 ? (mask === 32 ? 1 : 2) : (broadcastNum - networkNum - 1);
   const firstHost = mask >= 31 ? networkNum : networkNum + 1;
   const lastHost = mask >= 31 ? broadcastNum : broadcastNum - 1;
@@ -33,6 +34,8 @@ function parseCidr(cidr) {
     network: numberToIp(networkNum),
     broadcast: numberToIp(broadcastNum),
     mask,
+    subnetMask: numberToIp(maskBits),
+    totalAddresses,
     hostCount,
     firstHost: numberToIp(firstHost),
     lastHost: numberToIp(lastHost),
@@ -45,6 +48,21 @@ function ipToNumber(ip) {
 
 function numberToIp(num) {
   return [(num >>> 24) & 255, (num >>> 16) & 255, (num >>> 8) & 255, num & 255].join('.');
+}
+
+function isPrivateIPv4Cidr(cidr) {
+  const parsed = parseCidr(cidr);
+  if (!parsed || parsed.cidr !== cidr) return false;
+  const start = ipToNumber(parsed.network);
+  const end = ipToNumber(parsed.broadcast);
+  const privateRanges = [
+    parseCidr('10.0.0.0/8'),
+    parseCidr('172.16.0.0/12'),
+    parseCidr('192.168.0.0/16'),
+  ];
+  return privateRanges.some((range) => (
+    start >= ipToNumber(range.network) && end <= ipToNumber(range.broadcast)
+  ));
 }
 
 function enumerateHosts(cidr, maxHosts = 1024) {
@@ -60,4 +78,11 @@ function enumerateHosts(cidr, maxHosts = 1024) {
   return { info, hosts };
 }
 
-module.exports = { isValidIPv4, parseCidr, enumerateHosts, ipToNumber, numberToIp };
+module.exports = {
+  isValidIPv4,
+  parseCidr,
+  enumerateHosts,
+  ipToNumber,
+  numberToIp,
+  isPrivateIPv4Cidr,
+};
