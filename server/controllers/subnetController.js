@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const Subnet = require('../models/Subnet');
 const Device = require('../models/Device');
+const Collector = require('../models/Collector');
 const DiscoveryJob = require('../models/DiscoveryJob');
 const { parseCidr, ipToNumber } = require('../utils/ipValidation');
 const { MAX_DISCOVERY_HOSTS } = require('../utils/networkSafety');
@@ -65,6 +66,18 @@ function audit(action, req, subnet, details = {}) {
     at: new Date().toISOString(),
     ...details,
   }));
+}
+
+async function revokeCollectorsForSubnet(subnetId) {
+  const revokedAt = new Date();
+  await Collector.updateMany(
+    { subnet: subnetId, status: 'active' },
+    { $set: { status: 'revoked', revokedAt } },
+  );
+  await Device.updateMany(
+    { subnet: subnetId, collectorId: { $exists: true, $ne: null } },
+    { $set: { collectorId: null } },
+  );
 }
 
 async function findOverlap(cidr, excludedId = null) {
@@ -327,6 +340,9 @@ const updateSubnet = async (req, res) => {
       }
     }
     await subnet.save();
+    if (cidrChanged || subnet.status !== 'active' || subnet.approvalStatus !== 'approved' || !subnet.monitoringEnabled) {
+      await revokeCollectorsForSubnet(subnet._id);
+    }
     audit('updated', req, subnet, { cidrChanged, status: subnet.status });
     if (Object.entries(previousAuthorization).some(([key, value]) => value !== subnet[key])) {
       audit('authorization-updated', req, subnet, {
@@ -392,6 +408,7 @@ const disableSubnet = async (req, res) => {
       subnet.nextDiscoveryAt = null;
       cancelDiscoveryForSubnet(subnet._id);
       await subnet.save();
+      await revokeCollectorsForSubnet(subnet._id);
       audit('disabled', req, subnet);
       audit('authorization-updated', req, subnet, {
         monitoringEnabled: false,
@@ -417,6 +434,7 @@ const deleteSubnet = async (req, res) => {
       status: 'running',
     });
     if (runningJob) return res.status(409).json({ message: 'Subnet cannot be deleted while discovery is running for its CIDR' });
+    await revokeCollectorsForSubnet(subnet._id);
     await Subnet.deleteOne({ _id: subnet._id });
     audit('deleted', req, subnet);
     res.json({ message: 'Subnet removed' });

@@ -26,6 +26,7 @@ app.use(morgan('dev'));
 // Routes
 app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api/subnets', require('./routes/subnetRoutes'));
+app.use('/api/collectors', require('./routes/collectorRoutes'));
 app.use('/api/devices', require('./routes/deviceRoutes'));
 app.use('/api/dashboard', require('./routes/dashboardRoutes'));
 app.use('/api/alerts', require('./routes/alertRoutes'));

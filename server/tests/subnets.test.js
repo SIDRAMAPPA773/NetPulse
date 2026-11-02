@@ -5,6 +5,7 @@ const http = require('node:http');
 const jwt = require('jsonwebtoken');
 const Subnet = require('../models/Subnet');
 const Device = require('../models/Device');
+const Collector = require('../models/Collector');
 const User = require('../models/User');
 const DiscoveryJob = require('../models/DiscoveryJob');
 const { calculateSubnet } = require('../controllers/subnetController');
@@ -66,6 +67,8 @@ test('subnet API validates, persists, authorizes, approves, disables and deletes
   const originalCreate = Subnet.create;
   const originalDeleteOne = Subnet.deleteOne;
   const originalDeviceAggregate = Device.aggregate;
+  const originalDeviceUpdateMany = Device.updateMany;
+  const originalCollectorUpdateMany = Collector.updateMany;
   const originalJobExists = DiscoveryJob.exists;
   const originalUserFindById = User.findById;
   const originalJwtSecret = process.env.JWT_SECRET;
@@ -85,6 +88,8 @@ test('subnet API validates, persists, authorizes, approves, disables and deletes
     return createQuery(records.filter((item) => !excludedId || String(item._id) !== String(excludedId)));
   };
   Device.aggregate = async () => [];
+  Device.updateMany = async () => ({ modifiedCount: 0 });
+  Collector.updateMany = async () => ({ modifiedCount: 0 });
   Subnet.findById = (id) => records.find((item) => String(item._id) === String(id)) || null;
   Subnet.create = async (data) => {
     if (records.some((item) => item.cidr === data.cidr)) {
@@ -115,6 +120,8 @@ test('subnet API validates, persists, authorizes, approves, disables and deletes
     Subnet.create = originalCreate;
     Subnet.deleteOne = originalDeleteOne;
     Device.aggregate = originalDeviceAggregate;
+    Device.updateMany = originalDeviceUpdateMany;
+    Collector.updateMany = originalCollectorUpdateMany;
     DiscoveryJob.exists = originalJobExists;
     User.findById = originalUserFindById;
     console.info = originalConsoleInfo;

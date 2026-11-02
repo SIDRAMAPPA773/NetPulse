@@ -12,7 +12,7 @@ const metricSchema = new mongoose.Schema({
   jitter: { type: Number, default: null },
   packetLoss: { type: Number, default: null },
   availability: { type: Number, default: null },
-  status: { type: String, enum: ['UP', 'DOWN', 'WARNING', 'UNKNOWN'] },
+  status: { type: String, enum: ['UP', 'DOWN', 'WARNING', 'UNREACHABLE', 'UNKNOWN'] },
   cpuUtilization: { type: Number, default: null },
   memoryUtilization: { type: Number, default: null },
   incomingTraffic: { type: Number, default: null },

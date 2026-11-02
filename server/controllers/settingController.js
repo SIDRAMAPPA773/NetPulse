@@ -16,6 +16,8 @@ const PUBLIC_SETTING_KEYS = [
   'LATENCY_CRITICAL',
   'PACKET_LOSS_WARNING',
   'PACKET_LOSS_CRITICAL',
+  'DEVICE_DOWN_FAILURE_THRESHOLD',
+  'DEVICE_UP_RECOVERY_THRESHOLD',
 ];
 
 const getSettings = async (req, res) => {
@@ -107,9 +109,12 @@ const updateSettings = async (req, res) => {
         return res.status(400).json({ message: `${key} must be a number` });
       }
       const numericValue = value;
-      const max = key.startsWith('PACKET_LOSS_') ? 100 : 60000;
-      if (!Number.isFinite(numericValue) || numericValue < 0 || numericValue > max) {
-        return res.status(400).json({ message: `${key} must be between 0 and ${max}` });
+      const isStateThreshold = key.startsWith('DEVICE_');
+      const min = isStateThreshold ? 1 : 0;
+      const max = isStateThreshold ? 10 : key.startsWith('PACKET_LOSS_') ? 100 : 60000;
+      if (numericValue < min || numericValue > max || (isStateThreshold && !Number.isInteger(numericValue))) {
+        const expected = isStateThreshold ? 'an integer ' : '';
+        return res.status(400).json({ message: `${key} must be ${expected}between ${min} and ${max}` });
       }
     }
 

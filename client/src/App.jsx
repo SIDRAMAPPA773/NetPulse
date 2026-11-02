@@ -14,6 +14,7 @@ import Alerts from './pages/Alerts';
 import Reports from './pages/Reports';
 import Settings from './pages/Settings';
 import Subnets from './pages/Subnets';
+import Collectors from './pages/Collectors';
 
 const App = () => {
   return (
@@ -25,6 +26,7 @@ const App = () => {
             <Route index element={<Dashboard />} />
             <Route path="devices" element={<Devices />} />
             <Route path="subnets" element={<Subnets />} />
+            <Route path="collectors" element={<Collectors />} />
             <Route path="devices/:id" element={<DeviceDetails />} />
             <Route path="network-map" element={<NetworkMap />} />
             <Route path="performance" element={<Performance />} />

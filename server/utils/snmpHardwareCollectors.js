@@ -1,4 +1,5 @@
 const snmp = require('net-snmp');
+const { decryptCredential } = require('./snmpCredentialCrypto');
 
 const HARDWARE_OIDS = {
   // System
@@ -71,20 +72,22 @@ function createSnmpSession(device, options = {}) {
 
     if (level >= snmp.SecurityLevel.authNoPriv) {
       const authProto = device.snmpAuthProtocol || 'sha';
-      if (!snmp.AuthProtocols[authProto] || !device.snmpAuthKey) {
+      const authKey = decryptCredential(device.snmpAuthKey);
+      if (!snmp.AuthProtocols[authProto] || !authKey) {
         throw new Error('SNMPv3 authentication protocol and key are required');
       }
       user.authProtocol = snmp.AuthProtocols[authProto];
-      user.authKey = device.snmpAuthKey;
+      user.authKey = authKey;
     }
 
     if (level === snmp.SecurityLevel.authPriv) {
       const privProto = device.snmpPrivProtocol || 'aes';
-      if (!snmp.PrivProtocols[privProto] || !device.snmpPrivKey) {
+      const privKey = decryptCredential(device.snmpPrivKey);
+      if (!snmp.PrivProtocols[privProto] || !privKey) {
         throw new Error('SNMPv3 privacy protocol and key are required');
       }
       user.privProtocol = snmp.PrivProtocols[privProto];
-      user.privKey = device.snmpPrivKey;
+      user.privKey = privKey;
     }
 
     return snmp.createV3Session(device.ipAddress, user, {
@@ -95,7 +98,7 @@ function createSnmpSession(device, options = {}) {
   }
 
   const version = device.snmpVersion === '1' ? snmp.Version1 : snmp.Version2c;
-  return snmp.createSession(device.ipAddress, device.snmpCommunity || 'public', {
+  return snmp.createSession(device.ipAddress, decryptCredential(device.snmpCommunity) || 'public', {
     version,
     timeout,
     retries,

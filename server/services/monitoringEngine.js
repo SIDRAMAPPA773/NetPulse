@@ -1,6 +1,7 @@
 const cron = require('node-cron');
 const snmp = require('net-snmp');
 const Device = require('../models/Device');
+const Collector = require('../models/Collector');
 const Subnet = require('../models/Subnet');
 const Metric = require('../models/Metric');
 const Alert = require('../models/Alert');
@@ -38,6 +39,7 @@ const {
   getNetworkAuthorizationPolicy,
   getEffectiveDiscoveryAuthorizationMode,
 } = require('../utils/networkAuthorizationPolicy');
+const { transitionDeviceHealth } = require('../utils/deviceHealthState');
 
 const telemetryTestTimes = new Map();
 const SNMP_TEST_COOLDOWN_MS = 60_000;
@@ -72,6 +74,8 @@ let thresholds = {
   INTERFACE_UTILIZATION_WARNING: 80,
   INTERFACE_UTILIZATION_CRITICAL: 90,
   HEALTH_CRITICAL: 50,
+  DEVICE_DOWN_FAILURE_THRESHOLD: 3,
+  DEVICE_UP_RECOVERY_THRESHOLD: 2,
 };
 
 function isEnabled(value, fallback = false) {
@@ -110,6 +114,11 @@ function exactCounterValue(value) {
 }
 
 function classifySnmpError(error) {
+  if (error?.code === 'SNMP_CREDENTIAL_ENCRYPTION_KEY_MISSING'
+    || error?.code === 'SNMP_CREDENTIAL_ENCRYPTION_KEY_INVALID'
+    || error?.code === 'SNMP_CREDENTIAL_CIPHERTEXT_INVALID') {
+    return 'CREDENTIAL_CONFIGURATION_ERROR';
+  }
   const message = String(error?.message || error || '').toLowerCase();
   if (message.includes('timeout') || message.includes('timed out')) return 'TIMEOUT';
   if (message.includes('auth') || message.includes('usm')) return 'AUTHENTICATION_FAILED';
@@ -215,7 +224,9 @@ async function collectSnmp(device, options = {}) {
       supported: true,
       responded: false,
       errorCode,
-      reason: 'Unable to initialize the configured SNMP session',
+      reason: errorCode === 'CREDENTIAL_CONFIGURATION_ERROR'
+        ? 'SNMP credential encryption configuration or stored credential format is invalid'
+        : 'Unable to initialize the configured SNMP session',
       oidChecks: [{
         oid: HARDWARE_OIDS.sysUpTime,
         metricId: 'device_uptime',
@@ -627,8 +638,13 @@ async function resolveAlert(device, type) {
 }
 
 async function saveUnavailable(device, reason, collectionStatus = 'blocked') {
-  if (device.status !== 'UNKNOWN') {
+  const stateChanged = device.status !== 'UNKNOWN'
+    || device.consecutiveFailureCount !== 0
+    || device.consecutiveRecoveryCount !== 0;
+  if (stateChanged) {
     device.status = 'UNKNOWN';
+    device.consecutiveFailureCount = 0;
+    device.consecutiveRecoveryCount = 0;
     await device.save();
     getIO().emit('deviceUpdated', device.toJSON());
   }
@@ -845,16 +861,19 @@ async function processDevice(
       }
       : null;
 
-  const previousStatus = device.status;
-  let currentStatus = collectionStatus === 'error'
-    ? (reachable ? 'UP' : 'UNKNOWN')
-    : (reachable ? 'UP' : 'DOWN');
-  if (reachable && (
+  const previousStatus = device.status || 'UNKNOWN';
+  const degraded = reachable && (
     (latency !== null && latency >= thresholds.LATENCY_WARNING) ||
     (packetLoss !== null && packetLoss >= thresholds.PACKET_LOSS_WARNING)
-  )) {
-    currentStatus = 'WARNING';
-  }
+  );
+  const currentStatus = transitionDeviceHealth(device, {
+    reachable,
+    degraded,
+    collectionError: collectionStatus === 'error' && !reachable,
+  }, {
+    failureThreshold: thresholds.DEVICE_DOWN_FAILURE_THRESHOLD,
+    recoveryThreshold: thresholds.DEVICE_UP_RECOVERY_THRESHOLD,
+  });
 
   // Calculate device health score components
   const healthResult = calculateOverallHealthScore({
@@ -1175,11 +1194,24 @@ function startMonitoring() {
       }
 
       const now = Date.now();
-      const [devices, approvedSubnets, networkPolicySetting] = await Promise.all([
-        Device.find({ monitoringStatus: true }),
+      const [activeCollectors, approvedSubnets, networkPolicySetting] = await Promise.all([
+        Collector.find({ status: 'active' }).select('subnet').lean(),
         Subnet.find({ status: 'active', approvalStatus: 'approved' }).lean(),
         Setting.findOne({ key: 'NETWORK_AUTHORIZATION_POLICY' }),
       ]);
+      const monitoringSubnetIds = new Set(
+        approvedSubnets
+          .filter((subnet) => subnet.monitoringEnabled)
+          .map((subnet) => String(subnet._id)),
+      );
+      const activeCollectorSubnets = activeCollectors
+        .map((collector) => collector.subnet)
+        .filter((subnetId) => monitoringSubnetIds.has(String(subnetId)));
+      const devices = await Device.find({
+        monitoringStatus: true,
+        collectorId: null,
+        subnet: { $nin: activeCollectorSubnets },
+      }).select('+snmpCommunity +snmpAuthKey +snmpPrivKey');
       const networkAuthorizationPolicy = getNetworkAuthorizationPolicy(networkPolicySetting?.value);
       const monitoringAllowlist = parseAllowlist(process.env.MONITORING_TARGET_ALLOWLIST);
       const dueDevices = devices.filter((device) => {
@@ -1263,6 +1295,8 @@ module.exports = {
   startMonitoring,
   stopMonitoring,
   processDevice,
+  upsertAlert,
+  resolveAlert,
   updateSettingsCache,
   collectSnmp,
   classifySnmpError,

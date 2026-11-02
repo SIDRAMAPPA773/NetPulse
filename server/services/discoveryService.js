@@ -24,6 +24,7 @@ const {
 } = require('../utils/networkAuthorizationPolicy');
 const { isFreshInterfaceAuthorization } = require('./interfaceAuthorizationService');
 const { createSnmpSession, HARDWARE_OIDS } = require('../utils/snmpHardwareCollectors');
+const { transitionDeviceHealth } = require('../utils/deviceHealthState');
 const socketService = require('./socketService');
 
 const DISCOVERY_CONCURRENCY = Number.isInteger(Number(process.env.DISCOVERY_MAX_CONCURRENCY))
@@ -326,7 +327,7 @@ async function runReservedDiscovery({
         { macAddress: { $in: macAddresses } },
       ],
     })
-      .select('_id ipAddress monitoringStatus enrollmentStatus status lastSeen reachabilityMethod macAddress vendor hostname subnet enrollmentSource');
+      .select('_id ipAddress monitoringStatus enrollmentStatus status lastSeen reachabilityMethod macAddress vendor hostname subnet enrollmentSource consecutiveFailureCount consecutiveRecoveryCount');
     const existingByIp = new Map(existing.map((device) => [device.ipAddress, device]));
     const existingByMac = new Map(
       existing.filter((device) => device.macAddress)
@@ -374,7 +375,10 @@ async function runReservedDiscovery({
         if (enrollmentStatus === 'pending') pendingApprovalCount += 1;
       } else if (device) {
         const seenAt = new Date();
-        device.status = candidate.status;
+        device.status = transitionDeviceHealth(device, {
+          reachable: true,
+          degraded: candidate.status === 'WARNING',
+        });
         device.reachabilityMethod = candidate.reachabilityMethod;
         device.lastSeen = seenAt;
         device.lastDiscoveredAt = seenAt;

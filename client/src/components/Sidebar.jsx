@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useContext } from 'react';
 import { NavLink } from 'react-router-dom';
 import { 
   LayoutDashboard, 
@@ -10,11 +10,14 @@ import {
   ArrowLeftRight, 
   FileText,
   Radio,
+  RadioTower,
   X
 } from 'lucide-react';
 import clsx from 'clsx';
+import { AuthContext } from '../context/AuthContext';
 
 const Sidebar = ({ mobileOpen, setMobileOpen }) => {
+  const { user } = useContext(AuthContext);
   const navSections = [
     {
       title: 'COMMAND & CONTROL',
@@ -22,6 +25,7 @@ const Sidebar = ({ mobileOpen, setMobileOpen }) => {
         { name: 'Live Overview', path: '/', icon: LayoutDashboard, badge: 'Live' },
         { name: 'Device Inventory', path: '/devices', icon: Server },
         { name: 'Subnet Management', path: '/subnets', icon: Network },
+        ...(user?.role === 'admin' ? [{ name: 'Site Collectors', path: '/collectors', icon: RadioTower }] : []),
         { name: 'Topology Map', path: '/network-map', icon: Network },
       ]
     },

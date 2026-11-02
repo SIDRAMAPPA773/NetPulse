@@ -27,6 +27,7 @@ const {
   getNetworkAuthorizationPolicy,
   getEffectiveDiscoveryAuthorizationMode,
 } = require('../utils/networkAuthorizationPolicy');
+const { encryptCredential } = require('../utils/snmpCredentialCrypto');
 
 const publicDevice = (device) => {
   const result = device.toObject ? device.toObject() : { ...device };
@@ -337,21 +338,28 @@ const createDevice = async (req, res) => {
       ipv6Address,
       monitoringMethod: monitoringMethod || 'icmp',
       pollingInterval: pollingInterval === undefined ? 30 : Number(pollingInterval),
-      snmpCommunity,
+      snmpCommunity: encryptCredential(snmpCommunity),
       snmpVersion: snmpVersion || '2c',
       snmpInterfaceIndex: snmpInterfaceIndex === undefined ? undefined : Number(snmpInterfaceIndex),
       snmpSecurityLevel: snmpSecurityLevel || 'noAuthNoPriv',
       snmpSecurityName,
       snmpAuthProtocol: snmpAuthProtocol || 'sha',
-      snmpAuthKey,
+      snmpAuthKey: encryptCredential(snmpAuthKey),
       snmpPrivProtocol: snmpPrivProtocol || 'aes',
-      snmpPrivKey,
+      snmpPrivKey: encryptCredential(snmpPrivKey),
       snmpContext,
     });
 
     const createdDevice = await device.save();
     res.status(201).json(publicDevice(createdDevice));
   } catch (error) {
+    if (error.code === 'SNMP_CREDENTIAL_ENCRYPTION_KEY_MISSING'
+      || error.code === 'SNMP_CREDENTIAL_ENCRYPTION_KEY_INVALID') {
+      return res.status(503).json({ message: error.message });
+    }
+    if (error.code === 'SNMP_CREDENTIAL_INVALID') {
+      return res.status(400).json({ message: error.message });
+    }
     res.status(500).json({ message: 'Server Error' });
   }
 };
@@ -427,19 +435,23 @@ const updateDevice = async (req, res) => {
     const previousEnrollmentStatus = device.enrollmentStatus;
     if (monitoringStatus !== undefined) {
       device.monitoringStatus = monitoringStatus;
-      if (!device.monitoringStatus) device.status = 'UNKNOWN';
+      if (!device.monitoringStatus) {
+        device.status = 'UNKNOWN';
+        device.consecutiveFailureCount = 0;
+        device.consecutiveRecoveryCount = 0;
+      }
     }
     if (enrollmentStatus !== undefined) device.enrollmentStatus = enrollmentStatus;
     if (pollingInterval !== undefined) device.pollingInterval = Number(pollingInterval);
-    if (snmpCommunity !== undefined) device.snmpCommunity = snmpCommunity;
+    if (snmpCommunity !== undefined) device.snmpCommunity = encryptCredential(snmpCommunity);
     if (snmpVersion !== undefined) device.snmpVersion = snmpVersion;
     if (snmpInterfaceIndex !== undefined) device.snmpInterfaceIndex = Number(snmpInterfaceIndex);
     if (snmpSecurityLevel !== undefined) device.snmpSecurityLevel = snmpSecurityLevel;
     if (snmpSecurityName !== undefined) device.snmpSecurityName = snmpSecurityName;
     if (snmpAuthProtocol !== undefined) device.snmpAuthProtocol = snmpAuthProtocol;
-    if (snmpAuthKey) device.snmpAuthKey = snmpAuthKey;
+    if (snmpAuthKey) device.snmpAuthKey = encryptCredential(snmpAuthKey);
     if (snmpPrivProtocol !== undefined) device.snmpPrivProtocol = snmpPrivProtocol;
-    if (snmpPrivKey) device.snmpPrivKey = snmpPrivKey;
+    if (snmpPrivKey) device.snmpPrivKey = encryptCredential(snmpPrivKey);
     if (snmpContext !== undefined) device.snmpContext = snmpContext;
 
     if (device.monitoringStatus && device.enrollmentStatus === 'approved') {
@@ -476,6 +488,13 @@ const updateDevice = async (req, res) => {
     }
     res.json(publicDevice(updatedDevice));
   } catch (error) {
+    if (error.code === 'SNMP_CREDENTIAL_ENCRYPTION_KEY_MISSING'
+      || error.code === 'SNMP_CREDENTIAL_ENCRYPTION_KEY_INVALID') {
+      return res.status(503).json({ message: error.message });
+    }
+    if (error.code === 'SNMP_CREDENTIAL_INVALID') {
+      return res.status(400).json({ message: error.message });
+    }
     res.status(500).json({ message: 'Server Error' });
   }
 };

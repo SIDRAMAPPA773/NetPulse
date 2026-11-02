@@ -7,11 +7,13 @@ NetPulse is a college-network monitoring and performance-analysis application. T
 - The monitoring engine defaults to **simulation mode**. Simulated values are tagged `measurementSource: "simulated"` and are not campus observations.
 - Real polling uses ICMP for reachability and performance. A device is eligible only when its enrollment is approved and monitoring is enabled, its IP is inside an active approved subnet with subnet monitoring enabled, and the selected network authorization policy permits it. Legacy mode also requires `MONITORING_TARGET_ALLOWLIST`; application-managed mode replaces that per-IP/CIDR check with the approved subnet registry.
 - Real ICMP observations include reachability, RTT average/minimum/maximum/deviation, mean absolute consecutive-sample RTT difference (jitter), packet loss, and per-probe-window success percentage.
+- Device availability uses consecutive completed observations: by default three failed cycles mark a device down and two successful cycles confirm recovery. Collection/configuration errors do not count as reachability failures. Administrators can adjust both thresholds from Engine Settings (1–10); performance degradation remains a separate warning state.
+- The topology map displays enrolled devices but does not draw inferred links. Verified adjacency data (for example, observed LLDP/CDP neighbor records) is required before edges are presented.
 - SNMP v1/v2c/v3 collection uses bounded requests only for devices authorized by the selected network policy. It reads `sysUpTime`, IF-MIB counters, and supported hardware sources: UCD-SNMP CPU/memory scalars, the Host Resources processor/storage tables, Cisco CPU MIB values, and discovered Cisco environmental sensor rows. Unsupported OIDs remain null and include a reason. SNMPv3 credentials are server-side and never included in device/diagnostic responses or logs. SNMPv1 agents that reject a multi-OID request can limit the available diagnostic detail.
 - IF-MIB collection uses 64-bit high-capacity counters when available and 32-bit fallback, plus interface status, `ifSpeed`/`ifHighSpeed`, errors, and discards. Rates use consecutive samples and measured elapsed time; resets, interface changes, first samples, and missing counters produce null rates. Utilization is only calculated from a reported non-zero interface speed.
 - Temperature collection only reports a value when the bounded Cisco environmental table walk returns a sensor. Other vendor environmental MIBs are not yet implemented; no sensor response is reported as unsupported rather than as zero.
 - On Windows, when an enrolled device IP is assigned to an interface on the monitoring host, NetPulse can also measure that local interface's received (RX) and sent (TX) byte-counter deltas. This is host-interface traffic, not traffic for a remote gateway. Remote interface throughput requires a configured SNMP community and interface index on a supported device.
-- A secured host-agent integration is not configured. Windows Exporter and Prometheus `node_exporter` were evaluated as appropriate Windows/Linux exporters, respectively; their default unauthenticated HTTP endpoints must not be exposed. A future integration should use TLS and authentication (for example, an authenticated reverse proxy), explicit per-device configuration, request timeouts, and allowlisted targets. NetPulse does not infer that an agent is installed from reachability.
+- An outbound Node.js site collector and scoped backend API are implemented. Each collector is bound to one explicitly approved private subnet, uses a revocable bearer token over HTTPS, and can only report addresses in that scope. Deployment still requires a trusted HTTPS backend endpoint reachable from the site; Prepare.sh persistence and real-device integration have not been verified. Do not expose unauthenticated Windows Exporter or `node_exporter` endpoints.
 - Service/TCP, DNS, route tracing, discovery-performance, and engine resource/traffic metrics currently have documented definitions but no collector.
 - The Network Health Index is a heuristic: `100 - 10 * offline device count - 2 * average packet loss - 15 if average latency > 80 ms`, clamped to 0–100. It requires valid latency and loss samples, excludes unknown devices, is not normalized by fleet size, and is **not an SLA**.
 - The Reports page exports authenticated inventory, bounded stored telemetry, and recent incidents as CSV or JSON snapshots for 24 hours, 7 days, or 30 days. It does not create archived reports or certify SLAs. CSV fields are quoted and spreadsheet-formula-leading text is neutralized.
@@ -102,7 +104,9 @@ Both endpoints require authentication. Definitions are maintained in `server/con
 8. For application-managed authorization, select **Application-managed subnet authorization** in Engine Settings. To automatically register connected networks, enable automatic interface authorization and choose the allowed Wi-Fi, Ethernet, hotspot, and/or virtual interface types. The host cap cannot exceed 256 usable addresses. The backend refreshes interface authorization once per minute; **Synchronize connected networks now** performs the same authorization-only refresh immediately. Virtual/VPN interfaces are excluded unless explicitly selected. Only active interfaces with canonical RFC1918 IPv4 ranges are eligible; loopback, link-local, multicast, public, unknown, and oversized networks are rejected.
 9. Interface authorization creates active, approved subnet records with enrollment approval on, auto-enrollment off, monitoring disabled, and discovery scheduling off. A connected-network authorization is revalidated before discovery and expires if link state is not refreshed. Discovery still requires an explicit admin action or previously configured schedule. Monitoring each discovered device still requires approved enrollment, subnet monitoring enabled, and that device's monitoring switch enabled.
 
-The example `.env.example` contains placeholders, not production credentials. SNMPv3 is configurable per device with a security name, level, authentication protocol/key, and privacy protocol/key. SNMP community strings and v3 keys remain server-side and are excluded from device API/socket responses and diagnostic logs. The application does not encrypt SNMP credentials at the MongoDB field level; protect the database and backups, and use TLS for production.
+The example `.env.example` contains placeholders, not production credentials. SNMPv3 is configurable per device with a security name, level, authentication protocol/key, and privacy protocol/key. SNMP community strings and v3 keys are AES-256-GCM encrypted in MongoDB, excluded from device API/socket responses and logs, and decrypted only when creating an SNMP session. Set `SNMP_CREDENTIAL_ENCRYPTION_KEY` to a private base64-encoded 32-byte key from a secret manager before creating or updating SNMP credentials. Back up the key separately from the database; losing it makes encrypted credentials unrecoverable. Do not rotate the key without an explicit re-encryption procedure.
+
+For existing plaintext credentials, back up MongoDB and provision the key first, then run `node scripts\encryptSnmpCredentials.js` from `server` during a maintenance window. The migration is idempotent, updates only the SNMP community/authentication/privacy fields, and reports counts without printing secrets. Keep the key stable and available to every backend instance. Legacy plaintext values remain readable during staged migration, but should be migrated before production use.
 
 ## Initial setup
 
@@ -113,6 +117,7 @@ In PowerShell:
 ```powershell
 Copy-Item server\.env.example server\.env
 # Edit server\.env: set MONGO_URI and a private JWT_SECRET (32+ characters).
+# Set SNMP_CREDENTIAL_ENCRYPTION_KEY from a secret manager before configuring SNMP credentials.
 # Set ADMIN_INITIAL_PASSWORD in the environment for initial admin creation.
 Set-Location server
 npm install
@@ -132,6 +137,15 @@ npm run dev
 ```
 
 The frontend defaults to `http://localhost:5000` and Vite to `http://localhost:5173`. `CLIENT_ORIGIN` is a comma-separated allowlist of exact frontend origins (for example, `http://localhost:5173,http://127.0.0.1:5173`) used consistently by Express and Socket.IO. In development, those two local origins are the defaults when `CLIENT_ORIGIN` is unset; other environments allow only explicitly configured origins.
+
+## Remote site collector
+
+1. Register and approve a private subnet (maximum 256 usable hosts), then enable its monitoring policy.
+2. In **Site Collectors**, create one collector for that subnet and copy its bearer token immediately. The token is stored only as a SHA-256 hash and cannot be viewed again; revoke and replace it if lost or exposed.
+3. Configure the standalone agent from [`collector/README.md`](./collector/README.md) with its HTTPS backend URL, token, and exact approved CIDR. The agent scans and reports only that scope. Newly discovered addresses enter inventory as pending and are not monitored until approved and enabled.
+4. Collector-managed devices are excluded from local polling. Revoking the collector releases its device assignments back to the local engine.
+
+The backend must be reachable through a trusted HTTPS endpoint from the site. Do not expose the development backend directly to the internet. Real Prepare.sh persistence and remote device integration remain **not verified** until an HTTPS route and lab host are available.
 
 ## API history limits
 

@@ -21,9 +21,11 @@ const deviceSchema = new mongoose.Schema({
   enrollmentStatus: { type: String, enum: ['pending', 'approved'], default: 'approved' },
   enrollmentSource: { type: String, enum: ['manual', 'discovery'], default: 'manual' },
   subnet: { type: mongoose.Schema.Types.ObjectId, ref: 'Subnet', default: null },
+  collectorId: { type: mongoose.Schema.Types.ObjectId, ref: 'Collector', default: null },
   discoverySource: { type: String, default: null },
   firstDiscoveredAt: { type: Date, default: null },
   lastDiscoveredAt: { type: Date, default: null },
+  lastCollectorObservationAt: { type: Date, default: null },
   healthScore: { type: Number, default: null },
   healthStatus: {
     type: String,
@@ -36,7 +38,7 @@ const deviceSchema = new mongoose.Schema({
   monitoringStatus: { type: Boolean, default: true },
   monitoringMethod: { type: String, enum: ['icmp', 'snmp'], default: 'icmp' },
   pollingInterval: { type: Number, default: 30 }, // in seconds
-  snmpCommunity: { type: String },
+  snmpCommunity: { type: String, select: false },
   snmpVersion: { type: String, enum: ['1', '2c', '3'], default: '2c' },
   snmpInterfaceIndex: { type: Number, min: 1 },
   snmpSecurityLevel: {
@@ -58,7 +60,9 @@ const deviceSchema = new mongoose.Schema({
   },
   snmpPrivKey: { type: String, select: false },
   snmpContext: { type: String },
-  status: { type: String, enum: ['UP', 'DOWN', 'WARNING', 'UNKNOWN'], default: 'UNKNOWN' },
+  status: { type: String, enum: ['UP', 'DOWN', 'WARNING', 'UNREACHABLE', 'UNKNOWN'], default: 'UNKNOWN' },
+  consecutiveFailureCount: { type: Number, min: 0, default: 0 },
+  consecutiveRecoveryCount: { type: Number, min: 0, default: 0 },
   lastSeen: { type: Date },
 }, {
   timestamps: true,
@@ -73,5 +77,6 @@ const deviceSchema = new mongoose.Schema({
 });
 
 deviceSchema.index({ subnet: 1, enrollmentStatus: 1, monitoringStatus: 1 });
+deviceSchema.index({ monitoringStatus: 1, collectorId: 1 });
 
 module.exports = mongoose.model('Device', deviceSchema);

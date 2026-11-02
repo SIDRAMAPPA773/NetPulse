@@ -179,3 +179,46 @@ test('automatic authorization rejects empty scope and host limits above the hard
   assert.equal(hostLimitResponse.statusCode, 400);
   assert.equal(saved, false);
 });
+
+test('health transition settings accept bounded integer poll thresholds only', async (t) => {
+  const originalFind = Setting.find;
+  const originalFindOneAndUpdate = Setting.findOneAndUpdate;
+  let saved = false;
+  t.after(() => {
+    Setting.find = originalFind;
+    Setting.findOneAndUpdate = originalFindOneAndUpdate;
+  });
+  Setting.find = async () => [];
+  Setting.findOneAndUpdate = async () => { saved = true; };
+
+  const makeResponse = () => ({
+    status(code) {
+      this.statusCode = code;
+      return this;
+    },
+    json(body) {
+      this.body = body;
+      return this;
+    },
+  });
+
+  const acceptedResponse = makeResponse();
+  await updateSettings({
+    user: { _id: 'admin-id' },
+    body: {
+      DEVICE_DOWN_FAILURE_THRESHOLD: 4,
+      DEVICE_UP_RECOVERY_THRESHOLD: 2,
+    },
+  }, acceptedResponse);
+  assert.equal(acceptedResponse.statusCode, undefined);
+  assert.equal(saved, true);
+
+  saved = false;
+  const rejectedResponse = makeResponse();
+  await updateSettings({
+    user: { _id: 'admin-id' },
+    body: { DEVICE_DOWN_FAILURE_THRESHOLD: 2.5 },
+  }, rejectedResponse);
+  assert.equal(rejectedResponse.statusCode, 400);
+  assert.equal(saved, false);
+});

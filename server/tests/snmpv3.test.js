@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const snmp = require('net-snmp');
 const { createSnmpSession } = require('../utils/snmpHardwareCollectors');
+const { encryptCredential } = require('../utils/snmpCredentialCrypto');
 
 test('createSnmpSession constructs a valid SNMPv3 session config', () => {
   const origCreateV3 = snmp.createV3Session;
@@ -69,6 +70,38 @@ test('createSnmpSession preserves SNMPv2c session creation', () => {
     session.close();
   } finally {
     snmp.createSession = origCreate;
+  }
+});
+
+test('createSnmpSession decrypts stored SNMPv3 keys only for session creation', () => {
+  const originalKey = process.env.SNMP_CREDENTIAL_ENCRYPTION_KEY;
+  const originalCreateV3 = snmp.createV3Session;
+  process.env.SNMP_CREDENTIAL_ENCRYPTION_KEY = Buffer.alloc(32, 4).toString('base64');
+  let capturedUser;
+
+  snmp.createV3Session = (target, user) => {
+    capturedUser = user;
+    return { close: () => {} };
+  };
+
+  try {
+    const session = createSnmpSession({
+      ipAddress: '10.38.27.191',
+      snmpVersion: '3',
+      snmpSecurityLevel: 'authPriv',
+      snmpSecurityName: 'monitor',
+      snmpAuthProtocol: 'sha256',
+      snmpAuthKey: encryptCredential('auth-key'),
+      snmpPrivProtocol: 'aes',
+      snmpPrivKey: encryptCredential('privacy-key'),
+    });
+    assert.equal(capturedUser.authKey, 'auth-key');
+    assert.equal(capturedUser.privKey, 'privacy-key');
+    session.close();
+  } finally {
+    snmp.createV3Session = originalCreateV3;
+    if (originalKey === undefined) delete process.env.SNMP_CREDENTIAL_ENCRYPTION_KEY;
+    else process.env.SNMP_CREDENTIAL_ENCRYPTION_KEY = originalKey;
   }
 });
 

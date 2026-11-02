@@ -249,7 +249,7 @@ test('ICMP collector execution errors remain UNKNOWN and do not become false pac
   assert.equal(alertUpdateCount, previousAlertUpdateCount);
 });
 
-test('completed unanswered ICMP probes still report unreachable status', async () => {
+test('completed unanswered ICMP probes require repeated failures before reporting down', async () => {
   Alert.findOne = async () => null;
   Alert.create = async (alert) => ({ ...alert, _id: 'test-alert-id' });
   Alert.findById = () => ({
@@ -281,6 +281,10 @@ test('completed unanswered ICMP probes still report unreachable status', async (
     },
   };
 
+  await processDevice(device, { acquire: async () => {} });
+  assert.equal(device.status, 'UNKNOWN');
+  await processDevice(device, { acquire: async () => {} });
+  assert.equal(device.status, 'UNKNOWN');
   await processDevice(device, { acquire: async () => {} });
 
   const saved = persistedMetrics.at(-1);

@@ -33,18 +33,21 @@ const testTelemetry = async (req, res) => {
     }
 
     const device = await Device.findById(req.params.id)
-      .select('+snmpAuthKey +snmpPrivKey +telemetryDiagnostics');
+      .select('+snmpCommunity +snmpAuthKey +snmpPrivKey +telemetryDiagnostics');
     if (!device) return res.status(404).json({ message: 'Device not found' });
 
     const diagnostic = await testDeviceTelemetry(device);
-    if (diagnostic.errorCode) {
-      const status = diagnostic.errorCode === 'COOLDOWN' || diagnostic.errorCode === 'TEST_BUSY'
+    if (diagnostic.errorCode || diagnostic.status === 'CREDENTIAL_CONFIGURATION_ERROR') {
+      const errorCode = diagnostic.errorCode || diagnostic.status;
+      const status = errorCode === 'COOLDOWN' || errorCode === 'TEST_BUSY'
         ? 429
-        : diagnostic.errorCode === 'TARGET_NOT_APPROVED' || diagnostic.errorCode === 'EMERGENCY_STOP'
+        : errorCode === 'TARGET_NOT_APPROVED' || errorCode === 'EMERGENCY_STOP'
           ? 403
+          : errorCode === 'CREDENTIAL_CONFIGURATION_ERROR'
+            ? 503
           : 409;
       return res.status(status).json({
-        status: diagnostic.errorCode,
+        status: errorCode,
         reason: diagnostic.message,
       });
     }

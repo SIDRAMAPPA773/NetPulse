@@ -20,7 +20,9 @@ const Settings = () => {
     LATENCY_WARNING: 100,
     LATENCY_CRITICAL: 250,
     PACKET_LOSS_WARNING: 5,
-    PACKET_LOSS_CRITICAL: 15
+    PACKET_LOSS_CRITICAL: 15,
+    DEVICE_DOWN_FAILURE_THRESHOLD: 3,
+    DEVICE_UP_RECOVERY_THRESHOLD: 2
   });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -129,7 +131,9 @@ const Settings = () => {
       LATENCY_WARNING: 100,
       LATENCY_CRITICAL: 250,
       PACKET_LOSS_WARNING: 5,
-      PACKET_LOSS_CRITICAL: 15
+      PACKET_LOSS_CRITICAL: 15,
+      DEVICE_DOWN_FAILURE_THRESHOLD: 3,
+      DEVICE_UP_RECOVERY_THRESHOLD: 2
     });
   };
 
@@ -437,6 +441,42 @@ const Settings = () => {
               className="w-full bg-white border border-slate-300 rounded-xl px-4 py-2.5 text-slate-900 font-mono focus:outline-none focus:border-blue-500 shadow-2xs"
             />
             <p className="text-[11px] text-slate-400">Threshold for acute carrier loss or link disruption.</p>
+          </div>
+
+          <div className="space-y-2">
+            <label className="block text-slate-700 font-bold flex items-center justify-between">
+              <span>Failed Polls Before Down</span>
+              <span className="text-rose-700 font-mono font-bold">{settings.DEVICE_DOWN_FAILURE_THRESHOLD}</span>
+            </label>
+            <input
+              type="number"
+              min="1"
+              max="10"
+              step="1"
+              name="DEVICE_DOWN_FAILURE_THRESHOLD"
+              value={settings.DEVICE_DOWN_FAILURE_THRESHOLD}
+              onChange={handleChange}
+              className="w-full bg-white border border-slate-300 rounded-xl px-4 py-2.5 text-slate-900 font-mono focus:outline-none focus:border-blue-500 shadow-2xs"
+            />
+            <p className="text-[11px] text-slate-400">Require consecutive failed monitoring cycles before marking a device down (1–10).</p>
+          </div>
+
+          <div className="space-y-2">
+            <label className="block text-slate-700 font-bold flex items-center justify-between">
+              <span>Successful Polls Before Recovery</span>
+              <span className="text-emerald-700 font-mono font-bold">{settings.DEVICE_UP_RECOVERY_THRESHOLD}</span>
+            </label>
+            <input
+              type="number"
+              min="1"
+              max="10"
+              step="1"
+              name="DEVICE_UP_RECOVERY_THRESHOLD"
+              value={settings.DEVICE_UP_RECOVERY_THRESHOLD}
+              onChange={handleChange}
+              className="w-full bg-white border border-slate-300 rounded-xl px-4 py-2.5 text-slate-900 font-mono focus:outline-none focus:border-blue-500 shadow-2xs"
+            />
+            <p className="text-[11px] text-slate-400">Require consecutive successful polls before clearing a down state (1–10).</p>
           </div>
 
         </div>
