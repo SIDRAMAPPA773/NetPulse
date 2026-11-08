@@ -326,6 +326,9 @@ function calculateOverallHealthScore({
       traffic: traffic.score,
       hardware: hardware.score,
     },
+    scoreConfidence: coveragePercent >= 80 ? 'High' : (coveragePercent >= 50 ? 'Medium' : (coveragePercent > 0 ? 'Low' : 'None')),
+    contributingFactors: breakdown.filter((b) => b.score !== null).map((b) => `${b.name}: ${b.score}/100 (${b.reason})`),
+    mainFailureReasons: breakdown.filter((b) => b.score !== null && b.score < 80).map((b) => `${b.name}: ${b.reason}`),
     breakdown,
     explanation: overallScore === null
       ? `Overall health remains Unknown: only ${coveragePercent}% evidence coverage is available; at least ${MINIMUM_HEALTH_SCORE_COVERAGE_PERCENT}% is required`

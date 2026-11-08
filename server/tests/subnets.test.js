@@ -108,13 +108,11 @@ test('subnet API validates, persists, authorizes, approves, disables and deletes
     select: async () => ({ _id: id, role: String(id) === ids.admin ? 'admin' : 'viewer' }),
   });
 
+  const { Readable } = require('node:stream');
   const app = express();
   app.use(express.json());
   app.use('/api/subnets', require('../routes/subnetRoutes'));
-  const server = http.createServer(app);
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   t.after(async () => {
-    await new Promise((resolve) => server.close(resolve));
     Subnet.find = originalFind;
     Subnet.findById = originalFindById;
     Subnet.create = originalCreate;
@@ -129,16 +127,41 @@ test('subnet API validates, persists, authorizes, approves, disables and deletes
     else process.env.JWT_SECRET = originalJwtSecret;
   });
 
-  const baseUrl = `http://127.0.0.1:${server.address().port}/api/subnets`;
   const adminToken = jwt.sign({ id: ids.admin }, process.env.JWT_SECRET);
   const viewerToken = jwt.sign({ id: ids.viewer }, process.env.JWT_SECRET);
-  const request = (path, method, token, body) => fetch(`${baseUrl}${path}`, {
-    method,
-    headers: {
+  const request = (path, method, token, body) => new Promise((resolve, reject) => {
+    const payload = body ? JSON.stringify(body) : '';
+    const req = new Readable({
+      read() {
+        if (payload) this.push(payload);
+        this.push(null);
+      },
+    });
+    req.url = `/api/subnets${path}`;
+    req.method = method;
+    req.headers = {
       authorization: `Bearer ${token}`,
-      ...(body ? { 'content-type': 'application/json' } : {}),
-    },
-    ...(body ? { body: JSON.stringify(body) } : {}),
+      ...(body ? { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(payload)) } : {}),
+    };
+    const resHeaders = {};
+    let statusCode = 200;
+    let rawData = '';
+    const res = {
+      setHeader(k, v) { resHeaders[k.toLowerCase()] = v; },
+      getHeader(k) { return resHeaders[k.toLowerCase()]; },
+      status(c) { statusCode = c; return this; },
+      writeHead(c, h) { statusCode = c; if (h) Object.assign(resHeaders, h); return this; },
+      write(chunk) { rawData += chunk; },
+      end(chunk) {
+        if (chunk) rawData += chunk;
+        resolve({
+          status: statusCode,
+          json: async () => JSON.parse(rawData || '{}'),
+          text: async () => rawData,
+        });
+      },
+    };
+    app(req, res, reject);
   });
 
   const viewerList = await request('', 'GET', viewerToken);

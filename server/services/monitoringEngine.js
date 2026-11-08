@@ -40,6 +40,12 @@ const {
   getEffectiveDiscoveryAuthorizationMode,
 } = require('../utils/networkAuthorizationPolicy');
 const { transitionDeviceHealth } = require('../utils/deviceHealthState');
+const { probeServices } = require('../utils/tcpProbe');
+const { probeDnsIntelligence } = require('../utils/dnsProbe');
+const { computeLatencyMetrics, computePacketLossMetrics } = require('../utils/latencyStatsEngine');
+const { evaluateReachability } = require('../utils/multiMethodReachability');
+const { processDeviceAnomalies } = require('./anomalyDetectionService');
+const { syncPassiveInventory } = require('./passiveIntelligenceService');
 
 const telemetryTestTimes = new Map();
 const SNMP_TEST_COOLDOWN_MS = 60_000;
@@ -60,6 +66,7 @@ let cycleRunning = false;
 let monitoringTask = null;
 let discoveryTask = null;
 let interfaceAuthorizationTask = null;
+let passiveSyncTask = null;
 let currentCyclePromise = null;
 let scheduledDiscoveryRunning = false;
 let thresholds = {
@@ -761,6 +768,9 @@ async function processDevice(
   let incomingThroughputBps = null;
   let outgoingThroughputBps = null;
   let snmpData = null;
+  let tcpData = null;
+  let dnsData = null;
+  let reachabilityEval = null;
   let localInterface = null;
   let localInterfaceRates = null;
   let rawProbes = [];
@@ -779,6 +789,13 @@ async function processDevice(
     outgoingThroughputBps = reachable ? Math.floor(Math.random() * 80000) : null;
     availability = reachable ? 100 : 0;
     collectionStatus = 'simulated';
+    reachabilityEval = {
+      confirmedMethod: reachable ? (device.monitoringMethod === 'snmp' ? 'snmp' : 'icmp') : 'none',
+      isReachable: Boolean(reachable),
+      methodsChecked: [device.monitoringMethod === 'snmp' ? 'snmp' : 'icmp'],
+      methodsResponding: reachable ? [device.monitoringMethod === 'snmp' ? 'snmp' : 'icmp'] : [],
+      reason: reachable ? 'Simulated reachable' : 'Simulated unreachable',
+    };
   } else {
     const probe = await probeIcmp(device.ipAddress, {
       count: 5,
@@ -840,6 +857,32 @@ async function processDevice(
       }
     } else if (device.monitoringMethod === 'snmp') {
       reasonUnavailable = 'Device did not respond to ICMP; SNMP telemetry was not attempted';
+    }
+
+    let tcpData = null;
+    if (device.configuredTcpPorts && device.configuredTcpPorts.length > 0) {
+      const activePorts = device.configuredTcpPorts
+        .filter((p) => p.enabled !== false)
+        .map((p) => p.port)
+        .slice(0, 10);
+      if (activePorts.length > 0) {
+        tcpData = await probeServices(device.ipAddress, activePorts, { timeoutMs: 1000 });
+      }
+    }
+
+    let dnsData = null;
+    try {
+      dnsData = await probeDnsIntelligence(device.ipAddress, { timeoutMs: 1500, checkForward: false });
+    } catch {}
+
+    const reachabilityEval = evaluateReachability({
+      icmp: { reachable: probe.reachable, packetLoss: probe.packetLoss, error: probe.error },
+      tcp: tcpData,
+      snmp: snmpData,
+    });
+    reachable = reachabilityEval.isReachable;
+    if (reachable && (latency === null || latency === undefined) && tcpData?.responseTimeMs) {
+      latency = tcpData.responseTimeMs;
     }
 
     localInterface = localCounterSnapshot?.interfaces.find(
@@ -932,10 +975,22 @@ async function processDevice(
     temperatureThreshold: snmpData?.hardware?.temperature?.thresholdCelsius ?? null,
   });
 
+  const successfulRttSamples = rawProbes.filter((sample) => sample.success).map((sample) => sample.rttMs);
+  const latencyMetrics = computeLatencyMetrics(successfulRttSamples.length > 0 ? successfulRttSamples : (latency !== null ? [latency] : []));
+  const medianRtt = latencyMetrics.median;
+  const p95Rtt = latencyMetrics.p95;
+  const p99Rtt = latencyMetrics.p99;
+
   device.status = currentStatus;
   device.healthScore = healthResult.overallScore;
   device.healthStatus = healthResult.healthStatus;
-  if (reachable) device.lastSeen = new Date();
+  device.reachabilityMethod = reachabilityEval?.confirmedMethod || (reachable ? (snmpData?.responded ? 'snmp' : 'icmp') : 'none');
+  device.latencyStats = latencyMetrics;
+  if (dnsData) device.dnsIntelligence = dnsData;
+  if (reachable) {
+    device.lastSeen = new Date();
+    device.lastVerifiedAt = new Date();
+  }
   await device.save();
 
   const endedAt = new Date();
@@ -994,9 +1049,15 @@ async function processDevice(
     rttMin,
     rttMax,
     rttStddev,
+    medianRtt,
+    p95Rtt,
+    p99Rtt,
     jitter,
     packetLoss,
     availability,
+    tcp: tcpData,
+    dns: dnsData,
+    monitoringTier: device.monitoringTier || 'authorized',
     status: currentStatus,
     cpuUtilization,
     memoryUtilization,
@@ -1106,6 +1167,16 @@ async function processDevice(
       interface: trafficInterface?.metadata,
     },
   });
+
+  try {
+    await processDeviceAnomalies({
+      device,
+      currentMetric: metric,
+      thresholds,
+    });
+  } catch (anomalyErr) {
+    console.error('Anomaly evaluation error:', anomalyErr.message);
+  }
 
   // 1. Device Offline / Recovered Alerts
   if (currentStatus === 'DOWN') {
@@ -1315,6 +1386,11 @@ function startMonitoring() {
     synchronizeConnectedInterfaces()
       .catch((error) => console.error('Connected interface authorization sync failed:', error.name || 'UnknownError'));
   });
+  passiveSyncTask = cron.schedule('*/1 * * * *', () => {
+    if (!isEmergencyStopActive()) {
+      syncPassiveInventory().catch(() => {});
+    }
+  });
   console.log('Monitoring engine started');
 }
 
@@ -1325,6 +1401,8 @@ async function stopMonitoring() {
   discoveryTask = null;
   if (interfaceAuthorizationTask) interfaceAuthorizationTask.stop();
   interfaceAuthorizationTask = null;
+  if (passiveSyncTask) passiveSyncTask.stop();
+  passiveSyncTask = null;
   monitoringStarted = false;
   if (currentCyclePromise) await currentCyclePromise;
 }

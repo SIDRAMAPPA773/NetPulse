@@ -29,6 +29,8 @@ const {
 } = require('../utils/networkAuthorizationPolicy');
 const { encryptCredential } = require('../utils/snmpCredentialCrypto');
 const { testDeviceTelemetry } = require('../services/monitoringEngine');
+const { collectPassiveIntelligence, syncPassiveInventory, getLastPassiveSyncAt } = require('../services/passiveIntelligenceService');
+const { recordAuditEvent } = require('../utils/auditLogger');
 
 const publicDevice = (device) => {
   const result = device.toObject ? device.toObject() : { ...device };
@@ -40,7 +42,15 @@ const publicDevice = (device) => {
 
 const getDevices = async (req, res) => {
   try {
-    const devices = await Device.find({})
+    const filter = {};
+    const tier = req.query?.tier;
+    if (tier === 'authorized') {
+      filter.isPassiveOnly = { $ne: true };
+    } else if (tier === 'observed') {
+      filter.$or = [{ isPassiveOnly: true }, { monitoringTier: 'observed' }];
+    }
+
+    const devices = await Device.find(filter)
       .select('-snmpCommunity -snmpAuthKey -snmpPrivKey')
       .sort({ name: 1 })
       .limit(500);
@@ -159,7 +169,11 @@ const getDevices = async (req, res) => {
       };
     }));
   } catch (error) {
-    res.status(500).json({ message: 'Server Error' });
+    if (typeof res.status === 'function') {
+      res.status(500).json({ message: 'Server Error' });
+    } else {
+      res.json({ message: 'Server Error' });
+    }
   }
 };
 
@@ -305,7 +319,11 @@ const getDeviceById = async (req, res) => {
       res.status(404).json({ message: 'Device not found' });
     }
   } catch (error) {
-    res.status(500).json({ message: 'Server Error' });
+    if (typeof res.status === 'function') {
+      res.status(500).json({ message: 'Server Error' });
+    } else {
+      res.json({ message: 'Server Error' });
+    }
   }
 };
 
@@ -538,7 +556,29 @@ const updateDevice = async (req, res) => {
         return res.status(403).json({ message: authorization.reason, code: authorization.code });
       }
     }
+    if (Array.isArray(req.body.configuredTcpPorts)) {
+      device.configuredTcpPorts = req.body.configuredTcpPorts
+        .filter((p) => Number.isInteger(Number(p.port)) && Number(p.port) >= 1 && Number(p.port) <= 65535)
+        .slice(0, 10)
+        .map((p) => ({
+          port: Number(p.port),
+          serviceName: p.serviceName || undefined,
+          enabled: p.enabled !== false,
+        }));
+    }
+    if (req.body.gateway !== undefined) device.gateway = req.body.gateway;
+    if (req.body.monitoringTier !== undefined) device.monitoringTier = req.body.monitoringTier;
+    if (req.body.isPassiveOnly !== undefined) device.isPassiveOnly = req.body.isPassiveOnly;
+
     let updatedDevice = await device.save();
+    await recordAuditEvent({
+      action: 'DEVICE_UPDATED',
+      category: 'DEVICE',
+      userId: req.user?._id,
+      targetId: device._id,
+      targetName: device.name,
+      details: { ipAddress: device.ipAddress, monitoringStatus: device.monitoringStatus, monitoringTier: device.monitoringTier },
+    });
     if (
       (
         (previousEnrollmentStatus !== 'approved' && device.enrollmentStatus === 'approved')
@@ -596,7 +636,11 @@ const deleteDevice = async (req, res) => {
       res.status(404).json({ message: 'Device not found' });
     }
   } catch (error) {
-    res.status(500).json({ message: 'Server Error' });
+    if (typeof res.status === 'function') {
+      res.status(500).json({ message: 'Server Error' });
+    } else {
+      res.json({ message: 'Server Error' });
+    }
   }
 };
 
@@ -750,6 +794,39 @@ const enrollMultipleDevices = async (req, res) => {
   }
 };
 
+const getPassiveInventory = async (req, res) => {
+  try {
+    const snapshot = await collectPassiveIntelligence({ resolveDns: true });
+    const observedRecords = await Device.find({
+      $or: [{ monitoringTier: 'observed' }, { isPassiveOnly: true }],
+    }).lean();
+    res.json({
+      ...snapshot,
+      observedRecords,
+      lastSyncedAt: getLastPassiveSyncAt(),
+    });
+  } catch (error) {
+    console.error('Passive inventory query failed:', error);
+    res.status(500).json({ message: 'Error retrieving passive inventory' });
+  }
+};
+
+const refreshPassiveInventory = async (req, res) => {
+  try {
+    const result = await syncPassiveInventory();
+    await recordAuditEvent({
+      action: 'PASSIVE_INVENTORY_REFRESHED',
+      category: 'DEVICE',
+      userId: req.user?._id,
+      details: { syncedCount: result.synced, changesCount: result.changes.length },
+    });
+    res.json(result);
+  } catch (error) {
+    console.error('Passive inventory sync failed:', error);
+    res.status(500).json({ message: 'Error synchronizing passive inventory' });
+  }
+};
+
 module.exports = {
   getDevices,
   getNetworkInterfaces,
@@ -762,4 +839,6 @@ module.exports = {
   cancelDiscovery,
   getDiscoveryJobs,
   enrollMultipleDevices,
+  getPassiveInventory,
+  refreshPassiveInventory,
 };

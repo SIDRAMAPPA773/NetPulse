@@ -61,6 +61,27 @@ const OUI_DATABASE = new Map([
   ['30:B5:C2', 'TP-Link Corporation'], ['50:C7:BF', 'TP-Link Corporation'],
   ['70:4F:57', 'TP-Link Corporation'], ['98:DA:C4', 'TP-Link Corporation'],
   ['D8:0D:17', 'TP-Link Corporation'], ['EC:08:6B', 'TP-Link Corporation'],
+
+  // Fortinet
+  ['00:09:0F', 'Fortinet, Inc.'], ['70:4C:A5', 'Fortinet, Inc.'], ['90:6C:AC', 'Fortinet, Inc.'],
+
+  // Palo Alto Networks
+  ['00:1B:17', 'Palo Alto Networks'], ['08:66:1F', 'Palo Alto Networks'], ['D4:F4:BE', 'Palo Alto Networks'],
+
+  // SonicWall
+  ['00:06:B1', 'SonicWall'], ['00:17:C5', 'SonicWall'], ['18:B1:69', 'SonicWall'],
+
+  // Check Point
+  ['00:1C:7F', 'Check Point Software'],
+
+  // Synology & QNAP Storage
+  ['00:11:32', 'Synology Inc.'], ['00:08:9B', 'QNAP Systems'], ['24:5E:BE', 'QNAP Systems'],
+
+  // Juniper Networks
+  ['00:05:85', 'Juniper Networks'], ['00:19:E2', 'Juniper Networks'], ['54:E0:32', 'Juniper Networks'],
+
+  // Microsoft Hyper-V & KVM / Proxmox
+  ['00:15:5D', 'Microsoft Corporation (Hyper-V)'], ['52:54:00', 'QEMU / KVM Virtual Machine'],
 ]);
 
 function lookupVendorByMac(macAddress) {
@@ -115,6 +136,7 @@ function classifyDeviceType({
   openPorts = [],
   isGateway = false,
   hostname = null,
+  preferGateway = false,
 }) {
   const descLower = (sysDescr || '').toLowerCase();
   const hostLower = (hostname || '').toLowerCase();
@@ -122,25 +144,54 @@ function classifyDeviceType({
 
   // 1. Definite Gateway or Router indicator
   if (isGateway || descLower.includes('router') || descLower.includes('cisco ios') || descLower.includes('routeros') || descLower.includes('junos')) {
-    return 'router';
+    return preferGateway && isGateway ? 'gateway' : 'router';
   }
 
-  // 2. Switch indicator
+  // 2. Firewall indicator
+  if (
+    descLower.includes('firewall') || descLower.includes('fortigate') || descLower.includes('palo alto') ||
+    descLower.includes('pfsense') || descLower.includes('sonicwall') || descLower.includes('asa 55') ||
+    vendorLower.includes('fortinet') || vendorLower.includes('palo alto') || vendorLower.includes('checkpoint') ||
+    vendorLower.includes('sonicwall') || hostLower.includes('fw-') || hostLower.includes('firewall')
+  ) {
+    return 'firewall';
+  }
+
+  // 3. Switch indicator
   if (descLower.includes('switch') || descLower.includes('catalyst') || descLower.includes('nexus') || descLower.includes('procurve') || hostLower.includes('sw-') || hostLower.includes('switch')) {
     return 'switch';
   }
 
-  // 3. Printer indicator
+  // 4. Network Storage (NAS / SAN)
+  if (
+    descLower.includes('synology') || descLower.includes('qnap') || descLower.includes('truenas') ||
+    descLower.includes('freenas') || vendorLower.includes('synology') || vendorLower.includes('qnap') ||
+    openPorts.includes(2049) || openPorts.includes(3260) || openPorts.includes(5000) || openPorts.includes(5001) ||
+    hostLower.includes('nas') || hostLower.includes('storage')
+  ) {
+    return 'storage';
+  }
+
+  // 5. Virtual Machine / Hypervisor
+  if (
+    vendorLower.includes('vmware') || vendorLower.includes('qemu') || vendorLower.includes('hyper-v') ||
+    descLower.includes('vmware') || descLower.includes('virtualbox') || descLower.includes('qemu') ||
+    descLower.includes('kvm') || hostLower.includes('vm-')
+  ) {
+    return 'vm';
+  }
+
+  // 6. Printer indicator
   if (openPorts.includes(9100) || openPorts.includes(515) || descLower.includes('laserjet') || descLower.includes('printer') || hostLower.includes('prn') || hostLower.includes('printer')) {
     return 'printer';
   }
 
-  // 4. Access Point indicator
+  // 7. Access Point indicator
   if (descLower.includes('access point') || descLower.includes('unifi ap') || descLower.includes('airmax') || hostLower.includes('wap') || hostLower.includes('ap-')) {
     return 'ap';
   }
 
-  // 5. Server indicator (Web/DB/SSH server ports, Linux/Windows Server OS)
+  // 8. Server indicator (Web/DB/SSH server ports, Linux/Windows Server OS)
   if (
     openPorts.includes(22) || openPorts.includes(80) || openPorts.includes(443) ||
     openPorts.includes(3306) || openPorts.includes(5432) || openPorts.includes(8080) ||
@@ -153,17 +204,16 @@ function classifyDeviceType({
     return 'server';
   }
 
-  // 6. PC / Workstation indicator
+  // 9. PC / Workstation / Laptop / Desktop indicator
   if (openPorts.includes(3389) || openPorts.includes(445) || descLower.includes('windows 10') || descLower.includes('windows 11')) {
+    if (hostLower.includes('laptop') || hostLower.includes('nb-')) return 'laptop';
+    if (hostLower.includes('desktop') || hostLower.includes('dt-')) return 'desktop';
     return 'pc';
   }
 
-  // 7. Vendor hints when no ports or SNMP are accessible
-  if (vendorLower.includes('cisco') || vendorLower.includes('mikrotik')) {
-    return 'switch'; // common default for network appliance
-  }
-  if (vendorLower.includes('vmware')) {
-    return 'server';
+  // 10. Vendor hints when no ports or SNMP are accessible
+  if (vendorLower.includes('cisco') || vendorLower.includes('mikrotik') || vendorLower.includes('juniper')) {
+    return 'switch';
   }
   if (vendorLower.includes('raspberry pi')) {
     return 'server';

@@ -105,4 +105,19 @@ const getTraffic = async (req, res) => {
   }
 };
 
-module.exports = { getPerformance, getTraffic };
+const { computeFleetAnalytics } = require('../services/anomalyDetectionService');
+
+const getFleet = async (req, res) => {
+  try {
+    const devices = await Device.find({}).lean();
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+    const recentMetrics = await Metric.find({ createdAt: { $gte: oneHourAgo } }).lean();
+
+    const analytics = computeFleetAnalytics(devices, recentMetrics);
+    res.json(analytics);
+  } catch (error) {
+    res.status(500).json({ message: 'Server Error' });
+  }
+};
+
+module.exports = { getPerformance, getTraffic, getFleet };

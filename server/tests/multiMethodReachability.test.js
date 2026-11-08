@@ -55,3 +55,12 @@ test('evaluateReachability marks UNKNOWN when probing is blocked', () => {
   assert.equal(result.status, 'UNKNOWN');
   assert.equal(result.isReachable, false);
 });
+
+test('evaluateReachability does not mark UP from neighbour cache alone', () => {
+  const result = evaluateReachability({
+    neighbour: { ipAddress: '192.168.1.100', macAddress: '00:11:22:33:44:55', state: 'Reachable' },
+  });
+  assert.equal(result.status, 'UNKNOWN');
+  assert.equal(result.isReachable, false);
+  assert.match(result.reason, /Neighbour cache/);
+});

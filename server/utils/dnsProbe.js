@@ -63,7 +63,57 @@ async function resolveHostname(ip, options = {}) {
   }
 }
 
+async function probeDnsIntelligence(ip, options = {}) {
+  const reverseResult = await resolveHostname(ip, options);
+  let forwardMatchesReverse = null;
+  let isInconsistent = false;
+  let inconsistencyReason = null;
+  let forwardIps = [];
+
+  if (reverseResult.status === 'RESOLVED' && reverseResult.hostname && options.checkForward !== false) {
+    const timeoutMs = Number.isInteger(options.timeoutMs) ? options.timeoutMs : DEFAULT_DNS_TIMEOUT_MS;
+    try {
+      let timeoutHandle;
+      const timeoutPromise = new Promise((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          const err = new Error('Forward DNS lookup timed out');
+          err.code = 'ETIMEOUT';
+          reject(err);
+        }, timeoutMs);
+      });
+
+      const forwardAddresses = await Promise.race([
+        dns.resolve(reverseResult.hostname).catch(() => dns.lookup(reverseResult.hostname).then((res) => (res.address ? [res.address] : []))),
+        timeoutPromise,
+      ]);
+      clearTimeout(timeoutHandle);
+
+      forwardIps = Array.isArray(forwardAddresses) ? forwardAddresses : [];
+      if (forwardIps.length > 0) {
+        forwardMatchesReverse = forwardIps.includes(ip);
+        if (!forwardMatchesReverse) {
+          isInconsistent = true;
+          inconsistencyReason = `Reverse PTR ${reverseResult.hostname} forwards to ${forwardIps.join(', ')} rather than queried IP ${ip}`;
+        }
+      }
+    } catch {
+      // Forward lookup failed; reverse is still valid but forward check is inconclusive
+      forwardMatchesReverse = null;
+    }
+  }
+
+  return {
+    ...reverseResult,
+    ptr: reverseResult.hostname,
+    resolvedIps: forwardIps,
+    forwardMatchesReverse,
+    isInconsistent,
+    inconsistencyReason,
+  };
+}
+
 module.exports = {
   DEFAULT_DNS_TIMEOUT_MS,
   resolveHostname,
+  probeDnsIntelligence,
 };

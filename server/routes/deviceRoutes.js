@@ -10,7 +10,9 @@ const {
   discoverLocalDevices,
   cancelDiscovery,
   getDiscoveryJobs,
-  enrollMultipleDevices
+  enrollMultipleDevices,
+  getPassiveInventory,
+  refreshPassiveInventory,
 } = require('../controllers/deviceController');
 const { getDeviceMetrics } = require('../controllers/metricController');
 const { testTelemetry } = require('../controllers/telemetryController');
@@ -21,6 +23,10 @@ const router = express.Router();
 router.route('/')
   .get(protect, getDevices)
   .post(protect, admin, createDevice);
+
+// Passive IP Intelligence routes (placed before /:id)
+router.get('/passive-intelligence', protect, getPassiveInventory);
+router.post('/passive-intelligence/refresh', protect, admin, refreshPassiveInventory);
 
 // Network Auto-Discovery routes (placed before /:id)
 router.get('/network-interfaces', protect, admin, getNetworkInterfaces);
