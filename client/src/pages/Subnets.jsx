@@ -133,11 +133,40 @@ const Subnets = () => {
   useEffect(() => {
     if (!isAdmin) return;
     let active = true;
-    api.get('/devices/discovery/jobs')
-      .then(({ data }) => { if (active) setDiscoveryJobs(data); })
-      .catch((error) => console.error('Discovery history could not be loaded', error));
-    return () => { active = false; };
-  }, [isAdmin]);
+    const refreshJobs = async () => {
+      try {
+        const { data } = await api.get('/devices/discovery/jobs');
+        if (!active) return;
+        setDiscoveryJobs(data);
+        const runningJob = data.find(job => job.status === 'running');
+        if (runningJob && !discoverySubnetId) {
+          setDiscoverySubnetId(String(runningJob.subnet));
+          setDiscoveryProgress(runningJob);
+        }
+      } catch (error) {
+        if (active) console.error('Discovery history could not be loaded', error);
+      }
+    };
+    refreshJobs();
+    const timer = window.setInterval(refreshJobs, 3000);
+    const socket = getSocket();
+    const onProgress = (progress) => {
+      if (!active) return;
+      setDiscoveryProgress(progress);
+      setDiscoveryJobs(previous => previous.map(job => String(job._id) === String(progress.jobId)
+        ? { ...job, ...progress }
+        : job));
+      if (progress.status === 'running' || progress.status === 'cancelling') {
+        setDiscoverySubnetId(String(progress.subnetId));
+      }
+    };
+    socket?.on('discoveryProgress', onProgress);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+      socket?.off('discoveryProgress', onProgress);
+    };
+  }, [isAdmin, discoverySubnetId]);
 
   const openCreate = () => {
     setEditingSubnet(null);
@@ -222,15 +251,20 @@ const Subnets = () => {
   };
 
   const startDiscovery = async (subnet) => {
+    const existingJob = discoveryJobs.find(job => (
+      String(job.subnet) === String(subnet._id) && job.status === 'running'
+    ));
+    if (existingJob) {
+      setDiscoverySubnetId(subnet._id);
+      setDiscoveryProgress(existingJob);
+      setDiscoveryError('Discovery is already running; showing the existing job progress.');
+      return;
+    }
     setDiscoverySubnetId(subnet._id);
     setDiscoveryProgress({ checkedHosts: 0, totalHosts: subnet.usableHostCount, respondingHosts: 0 });
     setDiscoveryResult(null);
     setDiscoveryError('');
-    const socket = getSocket();
-    const onProgress = (progress) => {
-      if (progress.subnetId === subnet._id) setDiscoveryProgress(progress);
-    };
-    socket?.on('discoveryProgress', onProgress);
+    let keepWatching = false;
     try {
       const { data } = await api.post('/devices/discover', {
         subnetId: subnet._id,
@@ -243,10 +277,22 @@ const Subnets = () => {
       setDiscoveryJobs(jobs);
       await fetchSubnets(true);
     } catch (error) {
-      setDiscoveryError(error.response?.data?.message || 'Unable to discover this subnet.');
+      if (error.response?.status === 409 && error.response?.data?.code === 'DISCOVERY_ALREADY_RUNNING') {
+        const details = error.response.data.discovery || {};
+        setDiscoveryProgress({
+          ...details,
+          subnetId: details.subnetId || subnet._id,
+          status: details.status || 'running',
+        });
+        setDiscoveryError('Discovery is already running; showing the existing job progress.');
+        const { data: jobs } = await api.get('/devices/discovery/jobs');
+        setDiscoveryJobs(jobs);
+        keepWatching = true;
+      } else {
+        setDiscoveryError(error.response?.data?.message || 'Unable to discover this subnet.');
+      }
     } finally {
-      socket?.off('discoveryProgress', onProgress);
-      setDiscoverySubnetId(null);
+      if (!keepWatching) setDiscoverySubnetId(null);
     }
   };
 
@@ -393,7 +439,7 @@ const Subnets = () => {
                     {subnet.status === 'active' && subnet.approvalStatus === 'approved' && (
                       <button
                         type="button"
-                        disabled={Boolean(discoverySubnetId)}
+                        disabled={Boolean(discoverySubnetId) || discoveryJobs.some(job => String(job.subnet) === String(subnet._id) && job.status === 'running')}
                         onClick={() => startDiscovery(subnet)}
                         className="rounded-lg border border-sky-200 bg-sky-50 px-3 py-1.5 text-xs font-semibold text-sky-800 disabled:opacity-50"
                       >
@@ -410,7 +456,7 @@ const Subnets = () => {
                     <button type="button" onClick={() => runAction(subnet._id, 'delete', 'Delete this registered subnet?')} className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-1.5 text-xs font-semibold text-rose-700">Delete</button>
                   </div>
                 )}
-                {discoverySubnetId === subnet._id && (
+                {(discoverySubnetId === subnet._id || discoveryJobs.some(job => String(job.subnet) === String(subnet._id) && job.status === 'running')) && (
                   <div className="lg:col-span-2 rounded-xl border border-sky-200 bg-sky-50 p-3 text-xs text-sky-900">
                     <div className="flex items-center justify-between gap-3">
                       <span>

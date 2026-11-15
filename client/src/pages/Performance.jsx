@@ -188,6 +188,23 @@ const Performance = () => {
           <div className="text-2xl font-extrabold font-mono text-slate-900 mt-1">{summary.averagePacketLoss ?? 'Unavailable'}{summary.averagePacketLoss !== null && <span className="text-xs font-sans text-slate-400">%</span>}</div>
           <div className="text-[11px] text-rose-700 font-medium mt-1">{summary.averagePacketLoss === null ? 'No packet-loss samples' : 'Average of available probe samples'}</div>
         </div>
+        <div className="glass-card rounded-2xl p-4 border border-slate-200">
+          <span className="text-[11px] text-slate-500 font-bold uppercase tracking-wider">P95 / P99 RTT</span>
+          <div className="text-2xl font-extrabold font-mono text-violet-700 mt-1">
+            {summary.p95Latency ?? 'Unavailable'}{summary.p95Latency !== null && <span className="text-xs font-sans text-slate-400"> / {summary.p99Latency} ms</span>}
+          </div>
+          <div className="text-[11px] text-violet-700 font-medium mt-1">Percentiles from valid RTT samples</div>
+        </div>
+        <div className="glass-card rounded-2xl p-4 border border-slate-200">
+          <span className="text-[11px] text-slate-500 font-bold uppercase tracking-wider">Average Jitter</span>
+          <div className="text-2xl font-extrabold font-mono text-amber-700 mt-1">{summary.averageJitter ?? 'Unavailable'}{summary.averageJitter !== null && <span className="text-xs font-sans text-slate-400"> ms</span>}</div>
+          <div className="text-[11px] text-amber-700 font-medium mt-1">Mean absolute RTT difference</div>
+        </div>
+        <div className="glass-card rounded-2xl p-4 border border-slate-200">
+          <span className="text-[11px] text-slate-500 font-bold uppercase tracking-wider">Availability</span>
+          <div className="text-2xl font-extrabold font-mono text-emerald-700 mt-1">{summary.averageAvailability ?? 'Unavailable'}{summary.averageAvailability !== null && <span className="text-xs font-sans text-slate-400">%</span>}</div>
+          <div className="text-[11px] text-emerald-700 font-medium mt-1">Measured probe availability</div>
+        </div>
       </div>
 
       {/* Charts Grid */}

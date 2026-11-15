@@ -21,6 +21,10 @@ const discoveryJobSchema = new mongoose.Schema({
 discoveryJobSchema.index({ startedAt: -1 });
 discoveryJobSchema.index({ status: 1, startedAt: -1 });
 discoveryJobSchema.index({ subnet: 1, status: 1, startedAt: -1 });
+discoveryJobSchema.index(
+  { subnet: 1 },
+  { unique: true, partialFilterExpression: { status: 'running', subnet: { $type: 'objectId' } } },
+);
 discoveryJobSchema.index({ createdAt: 1 }, { expireAfterSeconds: 90 * 24 * 60 * 60 });
 
 module.exports = mongoose.model('DiscoveryJob', discoveryJobSchema);

@@ -73,6 +73,44 @@ const formatInterfaceStatus = (value) => ({
   7: 'lower-layer down',
 }[value] || (value == null ? 'Not collected' : `Unrecognized state (${value})`));
 
+const getTcpSummary = (device, latestMetric, metrics) => {
+  const configuredPorts = (device?.configuredTcpPorts || [])
+    .filter((entry) => entry?.enabled !== false && Number.isInteger(Number(entry.port)))
+    .map((entry) => ({
+      port: Number(entry.port),
+      serviceName: entry.serviceName || `TCP/${entry.port}`,
+    }));
+  const configuredPortNumbers = new Set(configuredPorts.map((entry) => entry.port));
+  const tcpSamples = (metrics || []).filter((metric) => Array.isArray(metric.tcp?.results));
+  const latestResults = new Map(
+    (latestMetric?.tcp?.results || []).map((result) => [Number(result.port), result]),
+  );
+  const attempts = tcpSamples.flatMap((metric) => (
+    (metric.tcp.results || []).filter((result) => configuredPortNumbers.has(Number(result.port)))
+  ));
+  const openAttempts = attempts.filter((result) => result.status === 'OPEN').length;
+  const latestSuccessful = tcpSamples.find((metric) => (
+    (metric.tcp.results || []).some((result) => (
+      configuredPortNumbers.has(Number(result.port)) && result.status === 'OPEN'
+    ))
+  ));
+  const latestFailure = tcpSamples.find((metric) => (
+    (metric.tcp.results || []).some((result) => (
+      configuredPortNumbers.has(Number(result.port)) && result.status !== 'OPEN'
+    ))
+  ));
+
+  return {
+    configuredPorts,
+    latestResults,
+    availabilityPercent: attempts.length > 0
+      ? Math.round((openAttempts / attempts.length) * 1000) / 10
+      : null,
+    lastSuccessfulAt: latestSuccessful?.createdAt || null,
+    lastFailureAt: latestFailure?.createdAt || null,
+  };
+};
+
 const getDeviceIcon = (type) => {
   switch (type) {
     case 'router': return <Router className="w-5 h-5 text-sky-600" />;
@@ -135,7 +173,18 @@ const DeviceDetails = () => {
 
     const socket = getSocket();
     const handleDeviceUpdated = (updatedDevice) => {
-      if (updatedDevice._id === id) setDevice(updatedDevice);
+      if (updatedDevice._id === id) {
+        setDevice((currentDevice) => ({
+          ...currentDevice,
+          ...updatedDevice,
+          monitoringAuthorized: updatedDevice.monitoringAuthorized
+            ?? currentDevice?.monitoringAuthorized,
+          monitoringAuthorizationCode: updatedDevice.monitoringAuthorizationCode
+            ?? currentDevice?.monitoringAuthorizationCode,
+          monitoringAuthorizationReason: updatedDevice.monitoringAuthorizationReason
+            ?? currentDevice?.monitoringAuthorizationReason,
+        }));
+      }
     };
     const handleMetricAdded = (newMetric) => {
       const metricDeviceId = typeof newMetric.device === 'object' ? newMetric.device?._id : newMetric.device;
@@ -324,6 +373,8 @@ const DeviceDetails = () => {
       setDiagnosticMessage(message);
     }
   };
+
+  const tcpSummary = getTcpSummary(device, latestCollection, metrics);
 
   return (
     <div className="w-full min-w-0 space-y-6 pb-12">
@@ -634,6 +685,87 @@ const DeviceDetails = () => {
             Health status: {healthStatus}. {health.explanation || 'No verified measurements are available to calculate an overall health score.'}
           </p>
         )}
+      </section>
+
+      <section className="glass-card-static rounded-2xl border border-slate-200 p-5 space-y-4">
+        <div>
+          <h2 className="text-base font-bold text-slate-900">Service and network path monitoring</h2>
+          <p className="text-xs text-slate-500">Each service result is shown independently from ICMP device availability.</p>
+        </div>
+        <div className="grid gap-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
+          <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+            <p className="font-semibold uppercase tracking-wide text-slate-500">TCP services</p>
+            <p className="mt-1 font-medium text-slate-800">
+              {tcpSummary.configuredPorts.length === 0
+                ? 'Not configured'
+                : `${latestCollection?.tcp?.openPorts?.length || 0}/${tcpSummary.configuredPorts.length} available`}
+            </p>
+            {tcpSummary.configuredPorts.length === 0 ? (
+              <p className="mt-1 text-slate-600">No administrator-approved service ports are configured.</p>
+            ) : (
+              <>
+                <p className="mt-1 text-slate-600">
+                  {latestCollection?.tcp?.responseTimeMs != null
+                    ? `${latestCollection.tcp.responseTimeMs} ms connection latency`
+                    : 'No TCP sample'}
+                </p>
+                <div className="mt-2 space-y-1">
+                  {tcpSummary.configuredPorts.map((configuredPort) => {
+                    const result = tcpSummary.latestResults.get(configuredPort.port);
+                    const status = result?.status || 'NOT_CONFIGURED';
+                    return (
+                      <div key={configuredPort.port} className="flex items-center justify-between gap-2 text-[11px]">
+                        <span className="text-slate-600">{configuredPort.serviceName} ({configuredPort.port})</span>
+                        <span className={clsx(
+                          'rounded px-1.5 py-0.5 font-bold',
+                          status === 'OPEN' ? 'bg-emerald-50 text-emerald-700' :
+                          status === 'CLOSED' ? 'bg-amber-50 text-amber-700' :
+                          status === 'TIMEOUT' ? 'bg-orange-50 text-orange-700' :
+                          status === 'ERROR' ? 'bg-rose-50 text-rose-700' :
+                          'bg-slate-200 text-slate-600',
+                        )}>
+                          {status}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+                <p className="mt-2 text-[11px] text-slate-500">
+                  Availability: {tcpSummary.availabilityPercent == null ? 'Not collected' : `${tcpSummary.availabilityPercent}%`}
+                  {' · '}Last success: {formatTimestamp(tcpSummary.lastSuccessfulAt)}
+                  {' · '}Last failure: {formatTimestamp(tcpSummary.lastFailureAt)}
+                </p>
+              </>
+            )}
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+            <p className="font-semibold uppercase tracking-wide text-slate-500">DNS checks</p>
+            <p className="mt-1 font-medium text-slate-800">
+              {latestMetric.dns?.queryResults?.length
+                ? `${latestMetric.dns.queryResults.filter(result => result.status === 'RESOLVED').length}/${latestMetric.dns.queryResults.length} resolved`
+                : latestMetric.dns?.status || 'Not configured'}
+            </p>
+            <p className="mt-1 text-slate-600">{latestMetric.dns?.queryResults?.length ? 'Configured resolver and domain checks' : latestMetric.dns?.errorReason || 'No DNS query sample'}</p>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+            <p className="font-semibold uppercase tracking-wide text-slate-500">HTTP / HTTPS</p>
+            <p className="mt-1 font-medium text-slate-800">
+              {latestMetric.http?.length
+                ? `${latestMetric.http.filter(result => result.available).length}/${latestMetric.http.length} available`
+                : 'Not configured'}
+            </p>
+            <p className="mt-1 text-slate-600">{latestMetric.http?.length ? `${latestMetric.http[0].responseTimeMs ?? '—'} ms · ${latestMetric.http[0].status}` : 'No HTTP sample'}</p>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+            <p className="font-semibold uppercase tracking-wide text-slate-500">Traceroute</p>
+            <p className="mt-1 font-medium text-slate-800">{latestMetric.traceroute?.status || 'Not configured'}</p>
+            <p className="mt-1 text-slate-600">
+              {latestMetric.traceroute
+                ? `${latestMetric.traceroute.respondingHopCount || 0} responding hops · destination ${latestMetric.traceroute.destinationReachable ? 'reachable' : 'unverified'}`
+                : 'No path sample'}
+            </p>
+          </div>
+        </div>
       </section>
 
       {/* Network Metrics Overview Strip */}

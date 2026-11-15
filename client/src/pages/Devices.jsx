@@ -138,6 +138,8 @@ const Devices = () => {
   const [showInterfacePreview, setShowInterfacePreview] = useState(false);
   const [networkInterfaces, setNetworkInterfaces] = useState([]);
   const [discoveryProgress, setDiscoveryProgress] = useState(null);
+  const [discoveryJobId, setDiscoveryJobId] = useState(null);
+  const [discoveryJobs, setDiscoveryJobs] = useState([]);
   const [selectedDiscoveryCidr, setSelectedDiscoveryCidr] = useState('');
   const [detectingInterfaces, setDetectingInterfaces] = useState(false);
   const [interfaceDetectionError, setInterfaceDetectionError] = useState('');
@@ -167,6 +169,9 @@ const Devices = () => {
 
   useEffect(() => {
     fetchDevices();
+    api.get('/devices/discovery/jobs')
+      .then(({ data }) => setDiscoveryJobs(data || []))
+      .catch(() => {});
 
     const socket = getSocket();
     const handleDeviceUpdated = (updatedDevice) => {
@@ -197,6 +202,42 @@ const Devices = () => {
       }
     };
   }, [fetchDevices]);
+
+  useEffect(() => {
+    if (!discoveryJobId) return undefined;
+    let active = true;
+    const refreshJob = async () => {
+      try {
+        const { data } = await api.get('/devices/discovery/jobs');
+        if (!active) return;
+        setDiscoveryJobs(data || []);
+        const job = (data || []).find(item => String(item._id) === String(discoveryJobId));
+        if (!job) return;
+        setDiscoveryProgress(job);
+        if (job.status !== 'running' && job.status !== 'cancelling') {
+          setScanning(false);
+          setDiscoveryJobId(null);
+          if (job.status === 'completed') {
+            setScanResults({
+              subnet: job.cidr,
+              subnetId: job.subnet,
+              status: job.status,
+              count: job.results?.length || job.respondingHosts || 0,
+              devices: job.results || [],
+            });
+          }
+        }
+      } catch {
+        // The progress socket remains the primary live update path.
+      }
+    };
+    refreshJob();
+    const timer = window.setInterval(refreshJob, 2000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [discoveryJobId]);
 
   const handleCreateDevice = async (e) => {
     e.preventDefault();
@@ -276,6 +317,15 @@ const Devices = () => {
       const { data } = await api.get('/devices/network-interfaces');
       setNetworkInterfaces(data.interfaces);
       setSelectedDiscoveryCidr(data.interfaces.find(item => item.discoveryApproved)?.discoveryCidr || '');
+      const jobsRes = await api.get('/devices/discovery/jobs');
+      setDiscoveryJobs(jobsRes.data || []);
+      const runningJob = (jobsRes.data || []).find(job => job.status === 'running');
+      if (runningJob) {
+        setDiscoveryJobId(String(runningJob._id));
+        setDiscoveryProgress(runningJob);
+        setShowScanModal(true);
+        setScanning(true);
+      }
     } catch (error) {
       console.error('Network interface detection failed', error);
       setInterfaceDetectionError(error.response?.data?.message || 'Unable to detect network interfaces.');
@@ -309,9 +359,13 @@ const Devices = () => {
     setScanning(true);
     setScanResults(null);
     setDiscoveryProgress({ checkedHosts: 0, totalHosts: 0, respondingHosts: 0 });
+    let keepWatching = false;
     const socket = getSocket();
     const handleDiscoveryProgress = (progress) => {
-      if (progress.cidr === cidr) setDiscoveryProgress(progress);
+      if (progress.cidr === cidr) {
+        setDiscoveryProgress(progress);
+        setDiscoveryJobId(progress.jobId);
+      }
     };
     socket?.on('discoveryProgress', handleDiscoveryProgress);
     try {
@@ -323,19 +377,32 @@ const Devices = () => {
       }, { signal: scanController.current.signal });
       setScanResults(res.data);
       setDiscoveryProgress(res.data);
+      setDiscoveryJobId(null);
       const unenrolled = new Set(
         res.data.devices.filter(d => !d.isEnrolled).map(d => d.ipAddress)
       );
       setSelectedIps(unenrolled);
     } catch (err) {
       if (err.code !== 'ERR_CANCELED') {
-        console.error('Discovery failed', err);
-        alert(err.response?.data?.message || 'Failed to run approved subnet discovery.');
+        if (err.response?.status === 409 && err.response?.data?.code === 'DISCOVERY_ALREADY_RUNNING') {
+          const details = err.response.data.discovery || {};
+          setDiscoveryProgress({
+            ...details,
+            cidr: details.cidr || cidr,
+            status: details.status || 'running',
+          });
+          setDiscoveryJobId(details.jobId || null);
+          setScanning(true);
+          keepWatching = Boolean(details.jobId);
+        } else {
+          console.error('Discovery failed', err);
+          alert(err.response?.data?.message || 'Failed to run approved subnet discovery.');
+        }
       }
     } finally {
       socket?.off('discoveryProgress', handleDiscoveryProgress);
       scanController.current = null;
-      setScanning(false);
+      if (!keepWatching) setScanning(false);
     }
   };
 

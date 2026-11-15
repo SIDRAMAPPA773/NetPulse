@@ -8,6 +8,7 @@ const http = require('http');
 const mongoose = require('mongoose');
 const socketService = require('./services/socketService');
 const { startMonitoring, stopMonitoring } = require('./services/monitoringEngine');
+const { recoverInterruptedDiscoveryJobs } = require('./services/discoveryService');
 
 dotenv.config();
 
@@ -47,6 +48,7 @@ const startServer = async () => {
     throw new Error('JWT_SECRET must be configured with at least 32 characters');
   }
   await connectDB();
+  await recoverInterruptedDiscoveryJobs();
   if (shuttingDown) return;
   server.listen(PORT, () => {
     console.log(`Server running in ${process.env.NODE_ENV} mode on port ${PORT}`);

@@ -1,6 +1,7 @@
 const Metric = require('../models/Metric');
 const Device = require('../models/Device');
 const mongoose = require('mongoose');
+const { calculateReliability } = require('../services/reliabilityAnalyticsService');
 
 const getPerformance = async (req, res) => {
   try {
@@ -120,4 +121,41 @@ const getFleet = async (req, res) => {
   }
 };
 
-module.exports = { getPerformance, getTraffic, getFleet };
+const getReliability = async (req, res) => {
+  try {
+    const allowedRanges = { '24h': 24, '7d': 24 * 7, '30d': 24 * 30 };
+    const range = req.query.range || '24h';
+    if (!Object.prototype.hasOwnProperty.call(allowedRanges, range)) {
+      return res.status(400).json({ message: 'Range must be one of 24h, 7d, or 30d' });
+    }
+    const filter = { createdAt: { $gte: new Date(Date.now() - allowedRanges[range] * 60 * 60 * 1000) } };
+    if (req.query.device) {
+      if (!mongoose.Types.ObjectId.isValid(req.query.device)) {
+        return res.status(400).json({ message: 'Invalid device ID' });
+      }
+      filter.device = req.query.device;
+    }
+    const metrics = await Metric.find(filter)
+      .select('device status createdAt availability')
+      .sort({ createdAt: 1 })
+      .limit(10000)
+      .lean();
+    const grouped = new Map();
+    for (const metric of metrics) {
+      const key = String(metric.device);
+      if (!grouped.has(key)) grouped.set(key, []);
+      grouped.get(key).push({ status: metric.status, at: metric.createdAt });
+    }
+    const devices = await Device.find({ _id: { $in: [...grouped.keys()] } }).select('name ipAddress').lean();
+    const deviceMap = new Map(devices.map((device) => [String(device._id), device]));
+    return res.json([...grouped.entries()].map(([deviceId, events]) => ({
+      device: deviceMap.get(deviceId) || { _id: deviceId },
+      ...calculateReliability(events, { start: filter.createdAt.$gte, end: new Date() }),
+    })));
+  } catch (error) {
+    console.error('Reliability analytics failed:', error.name || 'UnknownError');
+    return res.status(500).json({ message: 'Unable to calculate reliability analytics' });
+  }
+};
+
+module.exports = { getPerformance, getTraffic, getFleet, getReliability };

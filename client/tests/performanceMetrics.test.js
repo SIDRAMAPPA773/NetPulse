@@ -34,5 +34,9 @@ test('performance summaries do not fabricate values when no measurement is avail
     minimumLatency: null,
     maximumLatency: null,
     averagePacketLoss: null,
+    p95Latency: null,
+    p99Latency: null,
+    averageJitter: null,
+    averageAvailability: null,
   });
 });

@@ -103,6 +103,8 @@ const metricSchema = new mongoose.Schema({
     responseTimeMs: { type: Number, default: null },
     errorReason: { type: String, default: null },
   },
+  http: [{ type: mongoose.Schema.Types.Mixed }],
+  traceroute: { type: mongoose.Schema.Types.Mixed },
   snmp: {
     supported: { type: Boolean },
     responded: { type: Boolean },

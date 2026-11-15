@@ -150,6 +150,13 @@ function metricStatus(metric, collector, device, latestMetric, now, freshnessWin
 
 function summarizeMetricCoverage(metrics) {
   const summary = {
+    totalMetrics: metrics.length,
+    implementedMetrics: 0,
+    configuredMetrics: 0,
+    successfullyMeasuredMetrics: 0,
+    implementedFeatureCoveragePercent: 0,
+    configuredFeatureCoveragePercent: 0,
+    successfulMeasurementCoveragePercent: 0,
     totalSupportedMetrics: 0,
     successfullyCollectedMetrics: 0,
     unavailableMetrics: 0,
@@ -167,10 +174,16 @@ function summarizeMetricCoverage(metrics) {
   };
 
   for (const metric of metrics) {
-    if (metric.status === 'UNSUPPORTED') summary.unsupportedMetrics += 1;
-    else {
+    if (metric.status === 'UNSUPPORTED') {
+      summary.unsupportedMetrics += 1;
+    } else {
+      summary.implementedMetrics += 1;
       summary.totalSupportedMetrics += 1;
-      if (metric.status === 'AVAILABLE' || metric.status === 'SIMULATED') summary.successfullyCollectedMetrics += 1;
+      if (!['NOT_CONFIGURED', 'PENDING'].includes(metric.status)) summary.configuredMetrics += 1;
+      if (['AVAILABLE', 'SIMULATED'].includes(metric.status)) {
+        summary.successfullyCollectedMetrics += 1;
+        summary.successfullyMeasuredMetrics += 1;
+      }
       if (metric.status === 'SIMULATED') summary.simulatedMetrics += 1;
       if (metric.status === 'UNAVAILABLE') summary.unavailableMetrics += 1;
       if (metric.status === 'STALE') summary.staleMetrics += 1;
@@ -183,9 +196,16 @@ function summarizeMetricCoverage(metrics) {
       if (['ERROR', 'AUTHENTICATION_FAILED', 'TIMEOUT', 'COLLECTION_ERROR'].includes(metric.status)) summary.errorMetrics += 1;
     }
   }
-  summary.coveragePercent = summary.totalSupportedMetrics
-    ? Number((summary.successfullyCollectedMetrics / summary.totalSupportedMetrics * 100).toFixed(1))
+  summary.implementedFeatureCoveragePercent = summary.totalMetrics
+    ? Number((summary.implementedMetrics / summary.totalMetrics * 100).toFixed(1))
     : 0;
+  summary.configuredFeatureCoveragePercent = summary.implementedMetrics
+    ? Number((summary.configuredMetrics / summary.implementedMetrics * 100).toFixed(1))
+    : 0;
+  summary.successfulMeasurementCoveragePercent = summary.configuredMetrics
+    ? Number((summary.successfullyMeasuredMetrics / summary.configuredMetrics * 100).toFixed(1))
+    : 0;
+  summary.coveragePercent = summary.successfulMeasurementCoveragePercent;
   return summary;
 }
 

@@ -1,10 +1,11 @@
 const Device = require('../models/Device');
+const { validateTarget } = require('../utils/httpProbe');
+const { isValidIPv4 } = require('../utils/ipValidation');
 const Metric = require('../models/Metric');
 const Alert = require('../models/Alert');
 const DiscoveryJob = require('../models/DiscoveryJob');
 const Setting = require('../models/Setting');
 const Subnet = require('../models/Subnet');
-const { isValidIPv4 } = require('../utils/ipValidation');
 const { isValidIPv6 } = require('../utils/ipv6Validation');
 const { createDeviceMonitoringSummary } = require('../utils/deviceMonitoring');
 const networkInterfaceService = require('../utils/networkInterfaceService');
@@ -352,6 +353,10 @@ const createDevice = async (req, res) => {
       snmpPrivProtocol,
       snmpPrivKey,
       snmpContext,
+      configuredHttpChecks,
+      tracerouteEnabled,
+      tracerouteMaxHops,
+      configuredDnsChecks,
     } = req.body;
 
     if (!isValidIPv4(ipAddress) && !isValidIPv6(ipAddress)) {
@@ -368,6 +373,35 @@ const createDevice = async (req, res) => {
       !Number.isInteger(Number(snmpInterfaceIndex)) || Number(snmpInterfaceIndex) < 1
     )) {
       return res.status(400).json({ message: 'SNMP interface index must be a positive integer' });
+    }
+    if (configuredHttpChecks !== undefined && !Array.isArray(configuredHttpChecks)) {
+      return res.status(400).json({ message: 'configuredHttpChecks must be an array' });
+    }
+    if (configuredDnsChecks !== undefined && !Array.isArray(configuredDnsChecks)) {
+      return res.status(400).json({ message: 'configuredDnsChecks must be an array' });
+    }
+    if (tracerouteMaxHops !== undefined && (
+      !Number.isInteger(Number(tracerouteMaxHops))
+      || Number(tracerouteMaxHops) < 1
+      || Number(tracerouteMaxHops) > 64
+    )) {
+      return res.status(400).json({ message: 'tracerouteMaxHops must be between 1 and 64' });
+    }
+    if (Array.isArray(configuredHttpChecks)) {
+      for (const check of configuredHttpChecks.slice(0, 5)) {
+        const url = String(check.url || '');
+        const validation = validateTarget(url);
+        if (!validation.valid || ![ipAddress, hostname].filter(Boolean).includes(validation.url.hostname)) {
+          return res.status(400).json({ message: 'HTTP checks must use an approved device IP address or hostname' });
+        }
+        if (Array.isArray(configuredDnsChecks)) {
+          for (const check of configuredDnsChecks.slice(0, 5)) {
+            if (!isValidIPv4(String(check.server || '')) || typeof check.domain !== 'string' || !/^[a-z0-9.-]+$/i.test(check.domain)) {
+              return res.status(400).json({ message: 'DNS checks require an IPv4 resolver and valid test domain' });
+            }
+          }
+        }
+      }
     }
 
     const deviceExists = await Device.findOne({ ipAddress });
@@ -398,6 +432,28 @@ const createDevice = async (req, res) => {
       snmpPrivProtocol: snmpPrivProtocol || 'aes',
       snmpPrivKey: encryptCredential(snmpPrivKey),
       snmpContext,
+      configuredHttpChecks: Array.isArray(configuredHttpChecks)
+        ? configuredHttpChecks.slice(0, 5).map((check) => ({
+          url: String(check.url || ''),
+          method: check.method === 'HEAD' ? 'HEAD' : 'GET',
+          enabled: check.enabled !== false,
+          timeoutMs: Number.isInteger(Number(check.timeoutMs))
+            ? Math.min(30000, Math.max(100, Number(check.timeoutMs)))
+            : 5000,
+        }))
+        : [],
+      tracerouteEnabled: tracerouteEnabled === true,
+      tracerouteMaxHops: tracerouteMaxHops === undefined ? 30 : Number(tracerouteMaxHops),
+      configuredDnsChecks: Array.isArray(configuredDnsChecks)
+        ? configuredDnsChecks.slice(0, 5).map((check) => ({
+          server: String(check.server),
+          domain: String(check.domain).toLowerCase(),
+          enabled: check.enabled !== false,
+          timeoutMs: Number.isInteger(Number(check.timeoutMs))
+            ? Math.min(10000, Math.max(100, Number(check.timeoutMs)))
+            : 2000,
+        }))
+        : [],
     });
 
     const createdDevice = await device.save();
@@ -441,6 +497,10 @@ const updateDevice = async (req, res) => {
       snmpPrivProtocol,
       snmpPrivKey,
       snmpContext,
+      configuredHttpChecks,
+      tracerouteEnabled,
+      tracerouteMaxHops,
+      configuredDnsChecks,
     } = req.body;
 
     if (ipAddress !== undefined && !isValidIPv4(ipAddress) && !isValidIPv6(ipAddress)) {
@@ -463,6 +523,12 @@ const updateDevice = async (req, res) => {
     }
     if (enrollmentStatus !== undefined && !['pending', 'approved'].includes(enrollmentStatus)) {
       return res.status(400).json({ message: 'enrollmentStatus must be pending or approved' });
+    }
+    if (configuredHttpChecks !== undefined && !Array.isArray(configuredHttpChecks)) {
+      return res.status(400).json({ message: 'configuredHttpChecks must be an array' });
+    }
+    if (configuredDnsChecks !== undefined && !Array.isArray(configuredDnsChecks)) {
+      return res.status(400).json({ message: 'configuredDnsChecks must be an array' });
     }
 
     const device = await Device.findById(req.params.id)
@@ -504,6 +570,19 @@ const updateDevice = async (req, res) => {
     if (snmpPrivProtocol !== undefined) device.snmpPrivProtocol = snmpPrivProtocol;
     if (snmpPrivKey) device.snmpPrivKey = encryptCredential(snmpPrivKey);
     if (snmpContext !== undefined) device.snmpContext = snmpContext;
+    if (tracerouteEnabled !== undefined) {
+      if (typeof tracerouteEnabled !== 'boolean') {
+        return res.status(400).json({ message: 'tracerouteEnabled must be a boolean' });
+      }
+      device.tracerouteEnabled = tracerouteEnabled;
+    }
+    if (tracerouteMaxHops !== undefined) {
+      const maxHops = Number(tracerouteMaxHops);
+      if (!Number.isInteger(maxHops) || maxHops < 1 || maxHops > 64) {
+        return res.status(400).json({ message: 'tracerouteMaxHops must be between 1 and 64' });
+      }
+      device.tracerouteMaxHops = maxHops;
+    }
     const snmpConfigurationChanged = [
       'monitoringMethod',
       'snmpCommunity',
@@ -565,6 +644,41 @@ const updateDevice = async (req, res) => {
           serviceName: p.serviceName || undefined,
           enabled: p.enabled !== false,
         }));
+    }
+    if (Array.isArray(configuredHttpChecks)) {
+      for (const check of configuredHttpChecks.slice(0, 5)) {
+        const url = String(check.url || '');
+        const validation = validateTarget(url);
+        if (!validation.valid || ![device.ipAddress, device.hostname].filter(Boolean).includes(validation.url.hostname)) {
+          return res.status(400).json({ message: 'HTTP checks must use an approved device IP address or hostname' });
+        }
+      }
+      const checks = configuredHttpChecks.slice(0, 5).map((check) => {
+        const url = String(check.url || '');
+        const timeoutMs = Number(check.timeoutMs);
+        return {
+          url,
+          method: check.method === 'HEAD' ? 'HEAD' : 'GET',
+          enabled: check.enabled !== false,
+          timeoutMs: Number.isInteger(timeoutMs) ? Math.min(30000, Math.max(100, timeoutMs)) : 5000,
+        };
+      });
+      device.configuredHttpChecks = checks;
+    }
+    if (Array.isArray(configuredDnsChecks)) {
+      for (const check of configuredDnsChecks.slice(0, 5)) {
+        if (!isValidIPv4(String(check.server || '')) || typeof check.domain !== 'string' || !/^[a-z0-9.-]+$/i.test(check.domain)) {
+          return res.status(400).json({ message: 'DNS checks require an IPv4 resolver and valid test domain' });
+        }
+      }
+      device.configuredDnsChecks = configuredDnsChecks.slice(0, 5).map((check) => ({
+        server: String(check.server),
+        domain: String(check.domain).toLowerCase(),
+        enabled: check.enabled !== false,
+        timeoutMs: Number.isInteger(Number(check.timeoutMs))
+          ? Math.min(10000, Math.max(100, Number(check.timeoutMs)))
+          : 2000,
+      }));
     }
     if (req.body.gateway !== undefined) device.gateway = req.body.gateway;
     if (req.body.monitoringTier !== undefined) device.monitoringTier = req.body.monitoringTier;
@@ -684,10 +798,6 @@ const discoverLocalDevices = async (req, res) => {
       at: new Date().toISOString(),
     }));
 
-    const controller = new AbortController();
-    res.on('close', () => {
-      if (!res.writableEnded) controller.abort();
-    });
     const result = await runDiscoveryForSubnet({
       subnetId: subnet._id,
       requestedBy: req.user._id,
@@ -697,15 +807,20 @@ const discoverLocalDevices = async (req, res) => {
         checkServices: body.checkServices === true,
         ports,
       },
-      signal: controller.signal,
     });
     if (!res.writableEnded && !res.destroyed) res.json(result);
   } catch (error) {
     const statusCode = Number.isInteger(error.statusCode) ? error.statusCode : 500;
     if (statusCode === 500) console.error('Discovery request failed:', error.name || 'UnknownError');
-    if (!res.headersSent) res.status(statusCode).json({
-      message: statusCode === 500 ? 'Unable to complete approved subnet discovery' : error.message,
-    });
+    if (!res.headersSent) {
+      res.status(statusCode).json({
+        message: statusCode === 500 ? 'Unable to complete approved subnet discovery' : error.message,
+        ...(statusCode === 409 ? {
+          code: 'DISCOVERY_ALREADY_RUNNING',
+          discovery: error.discovery || null,
+        } : {}),
+      });
+    }
   }
 };
 

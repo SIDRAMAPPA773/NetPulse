@@ -41,7 +41,9 @@ const {
 } = require('../utils/networkAuthorizationPolicy');
 const { transitionDeviceHealth } = require('../utils/deviceHealthState');
 const { probeServices } = require('../utils/tcpProbe');
-const { probeDnsIntelligence } = require('../utils/dnsProbe');
+const { probeDnsIntelligence, probeDnsQuery } = require('../utils/dnsProbe');
+const { probeHttp } = require('../utils/httpProbe');
+const { runTraceroute } = require('../utils/tracerouteProbe');
 const { computeLatencyMetrics, computePacketLossMetrics } = require('../utils/latencyStatsEngine');
 const { evaluateReachability } = require('../utils/multiMethodReachability');
 const { processDeviceAnomalies } = require('./anomalyDetectionService');
@@ -60,7 +62,7 @@ const snmpState = new Map();
 const lastPolledAt = new Map();
 const localInterfaceCounterBaselines = new Map();
 
-let simulationMode = true;
+let simulationMode = false;
 let monitoringStarted = false;
 let cycleRunning = false;
 let monitoringTask = null;
@@ -100,7 +102,7 @@ async function updateSettingsCache() {
     key: { $in: ['SIMULATION_MODE', 'EMERGENCY_STOP', ...Object.keys(thresholds)] },
   });
   const values = new Map(settings.map((setting) => [setting.key, setting.value]));
-  simulationMode = isEnabled(values.get('SIMULATION_MODE'), true);
+  simulationMode = isEnabled(values.get('SIMULATION_MODE'), false);
   setEmergencyStop(isEnabled(values.get('EMERGENCY_STOP')));
   for (const key of Object.keys(thresholds)) {
     const value = Number(values.get(key));
@@ -770,6 +772,8 @@ async function processDevice(
   let snmpData = null;
   let tcpData = null;
   let dnsData = null;
+  let httpData = [];
+  let tracerouteData = null;
   let reachabilityEval = null;
   let localInterface = null;
   let localInterfaceRates = null;
@@ -859,7 +863,6 @@ async function processDevice(
       reasonUnavailable = 'Device did not respond to ICMP; SNMP telemetry was not attempted';
     }
 
-    let tcpData = null;
     if (device.configuredTcpPorts && device.configuredTcpPorts.length > 0) {
       const activePorts = device.configuredTcpPorts
         .filter((p) => p.enabled !== false)
@@ -870,10 +873,41 @@ async function processDevice(
       }
     }
 
-    let dnsData = null;
     try {
       dnsData = await probeDnsIntelligence(device.ipAddress, { timeoutMs: 1500, checkForward: false });
     } catch {}
+    if (Array.isArray(device.configuredDnsChecks)) {
+      const checks = device.configuredDnsChecks
+        .filter((check) => check.enabled !== false && check.server && check.domain)
+        .slice(0, 5);
+      if (checks.length > 0) {
+        const results = await Promise.all(checks.map((check) => probeDnsQuery(
+          check.server,
+          check.domain,
+          { timeoutMs: check.timeoutMs },
+        )));
+        dnsData = { ...(dnsData || {}), queryResults: results };
+      }
+    }
+
+    if (Array.isArray(device.configuredHttpChecks)) {
+      const checks = device.configuredHttpChecks
+        .filter((check) => check.enabled !== false && typeof check.url === 'string')
+        .slice(0, 5);
+      if (checks.length > 0) {
+        httpData = await Promise.all(checks.map((check) => probeHttp(check.url, {
+          method: check.method,
+          timeoutMs: check.timeoutMs,
+        })));
+      }
+    }
+    if (device.tracerouteEnabled && !isEmergencyStopActive()) {
+      await rateLimiter.acquire();
+      tracerouteData = await runTraceroute(device.ipAddress, {
+        maxHops: device.tracerouteMaxHops,
+        timeoutMs: 15000,
+      });
+    }
 
     const reachabilityEval = evaluateReachability({
       icmp: { reachable: probe.reachable, packetLoss: probe.packetLoss, error: probe.error },
@@ -954,6 +988,21 @@ async function processDevice(
     failureThreshold: thresholds.DEVICE_DOWN_FAILURE_THRESHOLD,
     recoveryThreshold: thresholds.DEVICE_UP_RECOVERY_THRESHOLD,
   });
+  if (currentStatus !== previousStatus) {
+    const transitionAt = new Date();
+    device.statusTransitions = [
+      ...(Array.isArray(device.statusTransitions) ? device.statusTransitions : []),
+      { from: previousStatus, to: currentStatus, at: transitionAt },
+    ].slice(-100);
+    if (currentStatus === 'DOWN' && !device.downtimeStartedAt) {
+      device.downtimeStartedAt = transitionAt;
+    } else if (currentStatus === 'UP' && device.downtimeStartedAt) {
+      const downtimeMs = Math.max(0, transitionAt.getTime() - new Date(device.downtimeStartedAt).getTime());
+      device.totalDowntimeMs = (Number(device.totalDowntimeMs) || 0) + downtimeMs;
+      device.lastRecoveryAt = transitionAt;
+      device.downtimeStartedAt = null;
+    }
+  }
 
   // Calculate device health score components
   const healthResult = calculateOverallHealthScore({
@@ -1057,6 +1106,8 @@ async function processDevice(
     availability,
     tcp: tcpData,
     dns: dnsData,
+    http: httpData,
+    traceroute: tracerouteData,
     monitoringTier: device.monitoringTier || 'authorized',
     status: currentStatus,
     cpuUtilization,
@@ -1246,7 +1297,21 @@ async function processDevice(
   }
 
   const publicDevice = device.toJSON();
-  getIO().emit('deviceUpdated', publicDevice);
+  const authorization = authorizeMonitoringDevice(
+    device,
+    approvedSubnets || [],
+    parseAllowlist(process.env.MONITORING_TARGET_ALLOWLIST),
+    {
+      authorizationMode: networkAuthorizationMode,
+      autoAuthorizeInterfaces,
+    },
+  );
+  getIO().emit('deviceUpdated', {
+    ...publicDevice,
+    monitoringAuthorized: authorization.authorized,
+    monitoringAuthorizationCode: authorization.code,
+    monitoringAuthorizationReason: authorization.reason,
+  });
   getIO().emit('metricAdded', metric);
 }
 

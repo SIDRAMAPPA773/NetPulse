@@ -35,16 +35,27 @@ const DISCOVERY_RATE_PER_SECOND = Number.isInteger(Number(process.env.DISCOVERY_
   : 2;
 const activeControllers = new Map();
 const lastStartedAt = new Map();
-let activeJobId = null;
+const startingSubnets = new Set();
 
 function isEnabled(value) {
   return value === true || value === 'true';
 }
 
-function discoveryFailure(message, status = 400) {
+function discoveryFailure(message, status = 400, details = {}) {
   const error = new Error(message);
   error.statusCode = status;
+  error.discovery = details;
   return error;
+}
+
+async function findRunningJob(subnetId) {
+  if (!/^[a-f\d]{24}$/i.test(String(subnetId))) {
+    const exists = await DiscoveryJob.exists({ subnet: subnetId, status: 'running' });
+    return exists ? { status: 'running' } : null;
+  }
+  return DiscoveryJob.findOne({ subnet: subnetId, status: 'running' })
+    .select('_id subnet cidr status totalHosts checkedHosts respondingHosts startedAt')
+    .lean();
 }
 
 function identityConfidence({ macAddress, hostname, openPorts, snmpResponded, neighbourEntry }) {
@@ -59,6 +70,24 @@ function identityConfidence({ macAddress, hostname, openPorts, snmpResponded, ne
     level: signals >= 4 ? 'high' : signals >= 2 ? 'medium' : 'low',
     signals,
   };
+}
+
+function emitDiscoveryProgress(progress) {
+  try {
+    socketService.getIO().to('admins').emit('discoveryProgress', progress);
+  } catch (error) {
+    if (error?.message !== 'Socket.io not initialized') throw error;
+    console.warn('Discovery progress socket is unavailable; continuing with database progress persistence');
+  }
+}
+
+function emitAdminEvent(event, payload) {
+  try {
+    socketService.getIO().to('admins').emit(event, payload);
+  } catch (error) {
+    if (error?.message !== 'Socket.io not initialized') throw error;
+    console.warn(`Discovery ${event} socket is unavailable; continuing without realtime notification`);
+  }
 }
 
 async function configuredSnmpIdentity(device, rateLimiter, signal) {
@@ -162,27 +191,69 @@ async function runReservedDiscovery({
     throw discoveryFailure('Subnet discovery cooldown is active', 429);
   }
 
-  const existingJob = await DiscoveryJob.exists({ subnet: subnet._id, status: 'running' });
-  if (existingJob) throw discoveryFailure('A discovery job is already running for this subnet', 409);
+  const existingJob = await findRunningJob(subnet._id);
+  if (existingJob) {
+    const hasController = activeControllers.has(String(existingJob._id));
+    if (!hasController) {
+      await DiscoveryJob.updateOne(
+        { _id: existingJob._id, status: 'running' },
+        {
+          $set: {
+            status: 'failed',
+            finishedAt: new Date(),
+            errorMessage: 'Discovery was interrupted by a backend restart',
+          },
+        },
+      );
+    } else {
+      throw discoveryFailure('A discovery job is already running for this subnet', 409, {
+        jobId: String(existingJob._id),
+        subnetId: String(subnet._id),
+        cidr: existingJob.cidr,
+        status: existingJob.status,
+        checkedHosts: existingJob.checkedHosts,
+        totalHosts: existingJob.totalHosts,
+        respondingHosts: existingJob.respondingHosts,
+        startedAt: existingJob.startedAt,
+      });
+    }
+  }
 
   const controller = new AbortController();
   const abortFromExternal = () => controller.abort();
   externalSignal?.addEventListener('abort', abortFromExternal, { once: true });
-  activeJobId = subnetKey;
   activeControllers.set(subnetKey, controller);
   lastStartedAt.set(subnetKey, now);
   let job = null;
   let finishRecorded = false;
 
   try {
-    job = await DiscoveryJob.create({
-      cidr: approval.cidr,
-      subnet: subnet._id,
-      requestedBy,
-      trigger,
-      status: 'running',
-      totalHosts: approval.hosts.length,
-    });
+    try {
+      job = await DiscoveryJob.create({
+        cidr: approval.cidr,
+        subnet: subnet._id,
+        requestedBy,
+        trigger,
+        status: 'running',
+        totalHosts: approval.hosts.length,
+      });
+    } catch (error) {
+      if (error?.code === 11000) {
+        const duplicateJob = await findRunningJob(subnet._id);
+        throw discoveryFailure('A discovery job is already running for this subnet', 409, {
+          jobId: duplicateJob?._id ? String(duplicateJob._id) : null,
+          subnetId: String(subnet._id),
+          cidr: duplicateJob?.cidr || approval.cidr,
+          status: duplicateJob?.status || 'running',
+          checkedHosts: duplicateJob?.checkedHosts || 0,
+          totalHosts: duplicateJob?.totalHosts || approval.hosts.length,
+          respondingHosts: duplicateJob?.respondingHosts || 0,
+          startedAt: duplicateJob?.startedAt || null,
+        });
+      }
+      throw error;
+    }
+    startingSubnets.delete(subnetKey);
     activeControllers.set(String(job._id), controller);
 
     const rateLimiter = createRateLimiter({ maxPerSecond: DISCOVERY_RATE_PER_SECOND });
@@ -212,7 +283,7 @@ async function runReservedDiscovery({
         respondingHosts: discovered.length,
         status: controller.signal.aborted ? 'cancelling' : 'running',
       };
-      socketService.getIO().to('admins').emit('discoveryProgress', progress);
+      emitDiscoveryProgress(progress);
       if (checkedHosts % 8 === 0 || checkedHosts === approval.hosts.length) {
         progressWrites = progressWrites.then(() => DiscoveryJob.updateOne(
           { _id: job._id },
@@ -389,7 +460,7 @@ async function runReservedDiscovery({
         if (!device.vendor || device.vendor === 'Unknown') device.vendor = candidate.vendor;
         if (!device.hostname && candidate.hostname) device.hostname = candidate.hostname;
         await device.save();
-        socketService.getIO().to('admins').emit('deviceUpdated', device.toJSON());
+        emitAdminEvent('deviceUpdated', device.toJSON());
       }
       if (device) candidate.deviceId = String(device._id);
     }
@@ -464,18 +535,48 @@ async function runReservedDiscovery({
     externalSignal?.removeEventListener('abort', abortFromExternal);
     activeControllers.delete(subnetKey);
     if (job) activeControllers.delete(String(job._id));
-    activeJobId = null;
+    startingSubnets.delete(subnetKey);
   }
 }
 
 async function runDiscoveryForSubnet(params) {
-  if (activeJobId) throw discoveryFailure('Another discovery job is already running', 409);
-  activeJobId = 'starting';
+  const subnetKey = String(params.subnetId);
+  if (startingSubnets.has(subnetKey)) {
+    const existingJob = await findRunningJob(params.subnetId);
+    throw discoveryFailure('A discovery job is already running for this subnet', 409, {
+      jobId: existingJob?._id ? String(existingJob._id) : null,
+      subnetId: subnetKey,
+      cidr: existingJob?.cidr || null,
+      status: existingJob?.status || 'starting',
+      checkedHosts: existingJob?.checkedHosts || 0,
+      totalHosts: existingJob?.totalHosts || 0,
+      respondingHosts: existingJob?.respondingHosts || 0,
+      startedAt: existingJob?.startedAt || null,
+    });
+  }
+  startingSubnets.add(subnetKey);
   try {
     return await runReservedDiscovery(params);
   } finally {
-    if (activeJobId === 'starting') activeJobId = null;
+    startingSubnets.delete(subnetKey);
   }
+}
+
+async function recoverInterruptedDiscoveryJobs() {
+  const result = await DiscoveryJob.updateMany(
+    { status: 'running' },
+    {
+      $set: {
+        status: 'failed',
+        finishedAt: new Date(),
+        errorMessage: 'Discovery was interrupted by a backend restart',
+      },
+    },
+  );
+  if (result.modifiedCount > 0) {
+    console.warn(`Marked ${result.modifiedCount} interrupted discovery job(s) as failed after backend restart`);
+  }
+  return result.modifiedCount;
 }
 
 async function cancelDiscoveryJob(jobId) {
@@ -495,4 +596,9 @@ function cancelDiscoveryForSubnet(subnetId) {
   return true;
 }
 
-module.exports = { runDiscoveryForSubnet, cancelDiscoveryJob, cancelDiscoveryForSubnet };
+module.exports = {
+  runDiscoveryForSubnet,
+  recoverInterruptedDiscoveryJobs,
+  cancelDiscoveryJob,
+  cancelDiscoveryForSubnet,
+};
