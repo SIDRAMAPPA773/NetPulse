@@ -6,7 +6,9 @@ function probeDnsQuery(server, domain, options = {}) {
   const timeoutMs = Number.isInteger(options.timeoutMs)
     ? Math.max(100, Math.min(options.timeoutMs, 10000))
     : DEFAULT_DNS_TIMEOUT_MS;
-  const resolver = new dns.Resolver();
+  const resolver = typeof options.resolverFactory === 'function'
+    ? options.resolverFactory()
+    : new dns.Resolver();
   try {
     resolver.setServers([server]);
   } catch (error) {
@@ -19,44 +21,63 @@ function probeDnsQuery(server, domain, options = {}) {
       errorReason: error.code || error.message,
     });
   }
+  const recordType = String(options.recordType || 'A').toUpperCase();
   const startTime = process.hrtime.bigint();
-  let timer;
-  const query = new Promise((resolve) => {
-    timer = setTimeout(() => resolve({
+  const queryMethod = {
+    A: 'resolve4',
+    AAAA: 'resolve6',
+    CNAME: 'resolveCname',
+    MX: 'resolveMx',
+    NS: 'resolveNs',
+    TXT: 'resolveTxt',
+    PTR: 'reverse',
+  }[recordType];
+  if (!queryMethod) {
+    return Promise.resolve({
       server,
       domain,
+      recordType,
+      status: 'INVALID',
+      responseTimeMs: null,
+      addresses: [],
+      errorReason: `Unsupported DNS record type: ${recordType}`,
+    });
+  }
+
+  const query = resolver[queryMethod](domain);
+  return Promise.race([
+    query.then((answers) => ({
+      server,
+      domain,
+      recordType,
+      status: 'RESOLVED',
+      responseTimeMs: Math.round(Number(process.hrtime.bigint() - startTime) / 1e6 * 10) / 10,
+      addresses: Array.isArray(answers) ? answers : [],
+      errorReason: null,
+    })).catch((error) => {
+      const status = error.code === 'ENOTFOUND' ? 'NXDOMAIN'
+        : error.code === 'ESERVFAIL' ? 'SERVFAIL'
+          : error.code === 'EREFUSED' ? 'REFUSED' : 'ERROR';
+      return {
+        server,
+        domain,
+        recordType,
+        status,
+        responseTimeMs: Math.round(Number(process.hrtime.bigint() - startTime) / 1e6 * 10) / 10,
+        addresses: [],
+        errorReason: error.code || error.message,
+      };
+    }),
+    new Promise((resolve) => setTimeout(() => resolve({
+      server,
+      domain,
+      recordType,
       status: 'TIMEOUT',
       responseTimeMs: Math.round(Number(process.hrtime.bigint() - startTime) / 1e6 * 10) / 10,
       addresses: [],
       errorReason: 'DNS query timed out',
-    }), timeoutMs);
-    resolver.resolve4(domain, (error, addresses) => {
-      if (error) {
-        clearTimeout(timer);
-        const status = error.code === 'ENOTFOUND' ? 'NXDOMAIN'
-          : error.code === 'ESERVFAIL' ? 'SERVFAIL'
-            : error.code === 'EREFUSED' ? 'REFUSED' : 'ERROR';
-        return resolve({
-          server,
-          domain,
-          status,
-          responseTimeMs: Math.round(Number(process.hrtime.bigint() - startTime) / 1e6 * 10) / 10,
-          addresses: [],
-          errorReason: error.code || error.message,
-        });
-      }
-      clearTimeout(timer);
-      return resolve({
-        server,
-        domain,
-        status: 'RESOLVED',
-        responseTimeMs: Math.round(Number(process.hrtime.bigint() - startTime) / 1e6 * 10) / 10,
-        addresses: Array.isArray(addresses) ? addresses : [],
-        errorReason: null,
-      });
-    });
-  });
-  return query;
+    }), timeoutMs)),
+  ]);
 }
 
 async function resolveHostname(ip, options = {}) {

@@ -884,7 +884,7 @@ async function processDevice(
         const results = await Promise.all(checks.map((check) => probeDnsQuery(
           check.server,
           check.domain,
-          { timeoutMs: check.timeoutMs },
+          { timeoutMs: check.timeoutMs, recordType: check.recordType },
         )));
         dnsData = { ...(dnsData || {}), queryResults: results };
       }
@@ -898,6 +898,7 @@ async function processDevice(
         httpData = await Promise.all(checks.map((check) => probeHttp(check.url, {
           method: check.method,
           timeoutMs: check.timeoutMs,
+          allowedHosts: [device.ipAddress, device.hostname],
         })));
       }
     }

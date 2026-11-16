@@ -138,6 +138,15 @@ const DeviceDetails = () => {
   const [diagnosticBusy, setDiagnosticBusy] = useState(false);
   const [diagnosticMessage, setDiagnosticMessage] = useState('');
   const [selectedInterfaceIndex, setSelectedInterfaceIndex] = useState('');
+  const [serviceConfig, setServiceConfig] = useState({
+    tcpPorts: '',
+    httpUrl: '',
+    dnsServer: '',
+    dnsDomain: '',
+    dnsRecordType: 'A',
+    tracerouteEnabled: false,
+    tracerouteMaxHops: 30,
+  });
 
   useEffect(() => {
     let active = true;
@@ -159,6 +168,18 @@ const DeviceDetails = () => {
         setSelectedInterfaceIndex(deviceRes.data.snmpInterfaceIndex
           ? String(deviceRes.data.snmpInterfaceIndex)
           : '');
+        setServiceConfig({
+          tcpPorts: (deviceRes.data.configuredTcpPorts || [])
+            .filter((entry) => entry.enabled !== false)
+            .map((entry) => entry.port)
+            .join(', '),
+          httpUrl: deviceRes.data.configuredHttpChecks?.[0]?.url || '',
+          dnsServer: deviceRes.data.configuredDnsChecks?.[0]?.server || '',
+          dnsDomain: deviceRes.data.configuredDnsChecks?.[0]?.domain || '',
+          dnsRecordType: deviceRes.data.configuredDnsChecks?.[0]?.recordType || 'A',
+          tracerouteEnabled: deviceRes.data.tracerouteEnabled === true,
+          tracerouteMaxHops: deviceRes.data.tracerouteMaxHops || 30,
+        });
         setLoadError('');
       } catch (error) {
         if (active) {
@@ -373,6 +394,38 @@ const DeviceDetails = () => {
       setDiagnosticMessage(message);
     }
   };
+  const saveServiceConfiguration = async () => {
+    const ports = serviceConfig.tcpPorts
+      .split(',')
+      .map((value) => Number(value.trim()))
+      .filter((port) => Number.isInteger(port) && port >= 1 && port <= 65535)
+      .slice(0, 10)
+      .map((port) => ({ port, enabled: true }));
+    const configuredHttpChecks = serviceConfig.httpUrl.trim()
+      ? [{ url: serviceConfig.httpUrl.trim(), method: 'GET', enabled: true }]
+      : [];
+    const configuredDnsChecks = serviceConfig.dnsServer.trim() && serviceConfig.dnsDomain.trim()
+      ? [{
+        server: serviceConfig.dnsServer.trim(),
+        domain: serviceConfig.dnsDomain.trim(),
+        recordType: serviceConfig.dnsRecordType,
+        enabled: true,
+      }]
+      : [];
+    try {
+      const { data } = await api.put(`/devices/${id}`, {
+        configuredTcpPorts: ports,
+        configuredHttpChecks,
+        configuredDnsChecks,
+        tracerouteEnabled: serviceConfig.tracerouteEnabled,
+        tracerouteMaxHops: Number(serviceConfig.tracerouteMaxHops),
+      });
+      setDevice((current) => ({ ...current, ...data }));
+      setDiagnosticMessage('Service monitoring configuration saved. Measurements will appear after the next authorized poll.');
+    } catch (error) {
+      setDiagnosticMessage(error.response?.data?.message || 'Unable to save service monitoring configuration.');
+    }
+  };
 
   const tcpSummary = getTcpSummary(device, latestCollection, metrics);
 
@@ -552,6 +605,87 @@ const DeviceDetails = () => {
           </div>
         )}
       </section>
+
+      {user?.role === 'admin' && (
+        <section className="glass-card-static rounded-2xl border border-slate-200 p-5 space-y-4">
+          <div>
+            <h2 className="text-base font-bold text-slate-900">Approved service monitoring configuration</h2>
+            <p className="text-xs text-slate-500">Only these explicitly configured checks will run for this authorized device.</p>
+          </div>
+          <div className="grid gap-3 text-xs sm:grid-cols-2">
+            <label className="space-y-1">
+              <span className="font-semibold text-slate-600">TCP ports (comma-separated)</span>
+              <input
+                value={serviceConfig.tcpPorts}
+                onChange={(event) => setServiceConfig((current) => ({ ...current, tcpPorts: event.target.value }))}
+                placeholder="443, 22"
+                className="w-full rounded-lg border border-slate-300 px-3 py-2"
+              />
+            </label>
+            <label className="space-y-1">
+              <span className="font-semibold text-slate-600">HTTP/HTTPS URL</span>
+              <input
+                value={serviceConfig.httpUrl}
+                onChange={(event) => setServiceConfig((current) => ({ ...current, httpUrl: event.target.value }))}
+                placeholder={`https://${device.hostname || device.ipAddress}/health`}
+                className="w-full rounded-lg border border-slate-300 px-3 py-2"
+              />
+            </label>
+            <label className="space-y-1">
+              <span className="font-semibold text-slate-600">DNS resolver</span>
+              <input
+                value={serviceConfig.dnsServer}
+                onChange={(event) => setServiceConfig((current) => ({ ...current, dnsServer: event.target.value }))}
+                placeholder="8.8.8.8"
+                className="w-full rounded-lg border border-slate-300 px-3 py-2"
+              />
+            </label>
+            <label className="space-y-1">
+              <span className="font-semibold text-slate-600">DNS domain</span>
+              <input
+                value={serviceConfig.dnsDomain}
+                onChange={(event) => setServiceConfig((current) => ({ ...current, dnsDomain: event.target.value }))}
+                placeholder="example.com"
+                className="w-full rounded-lg border border-slate-300 px-3 py-2"
+              />
+            </label>
+            <label className="space-y-1">
+              <span className="font-semibold text-slate-600">DNS record type</span>
+              <select
+                value={serviceConfig.dnsRecordType}
+                onChange={(event) => setServiceConfig((current) => ({ ...current, dnsRecordType: event.target.value }))}
+                className="w-full rounded-lg border border-slate-300 px-3 py-2"
+              >
+                {['A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT', 'PTR'].map((type) => <option key={type}>{type}</option>)}
+              </select>
+            </label>
+            <label className="flex items-center gap-2 pt-6 font-semibold text-slate-600">
+              <input
+                type="checkbox"
+                checked={serviceConfig.tracerouteEnabled}
+                onChange={(event) => setServiceConfig((current) => ({ ...current, tracerouteEnabled: event.target.checked }))}
+              />
+              Enable bounded traceroute
+            </label>
+          </div>
+          <div className="flex items-center gap-3">
+            <label className="text-xs font-semibold text-slate-600">
+              Max hops
+              <input
+                type="number"
+                min="1"
+                max="64"
+                value={serviceConfig.tracerouteMaxHops}
+                onChange={(event) => setServiceConfig((current) => ({ ...current, tracerouteMaxHops: event.target.value }))}
+                className="ml-2 w-20 rounded-lg border border-slate-300 px-2 py-1.5"
+              />
+            </label>
+            <button type="button" onClick={saveServiceConfiguration} className="rounded-lg bg-sky-600 px-3 py-2 text-xs font-bold text-white hover:bg-sky-700">
+              Save approved checks
+            </button>
+          </div>
+        </section>
+      )}
 
       {/* Freshness & Monitoring Safety Banner */}
       {latestMetric.createdAt && (
