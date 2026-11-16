@@ -59,9 +59,16 @@ const deviceSchema = new mongoose.Schema({
   configuredDnsChecks: [{
     server: { type: String, required: true },
     domain: { type: String, required: true },
+    recordType: {
+      type: String,
+      enum: ['A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT', 'PTR'],
+      default: 'A',
+    },
     enabled: { type: Boolean, default: true },
     timeoutMs: { type: Number, min: 100, max: 10000, default: 2000 },
   }],
+  tracerouteEnabled: { type: Boolean, default: false },
+  tracerouteMaxHops: { type: Number, min: 1, max: 64, default: 30 },
   latencyStats: { type: mongoose.Schema.Types.Mixed },
   packetLossStats: { type: mongoose.Schema.Types.Mixed },
   enrollmentStatus: { type: String, enum: ['pending', 'approved'], default: 'approved' },

@@ -34,6 +34,9 @@ function probeHttp(targetUrl, options = {}) {
   const maxRedirects = Number.isInteger(options.maxRedirects)
     ? Math.max(0, Math.min(options.maxRedirects, MAX_REDIRECTS))
     : MAX_REDIRECTS;
+  const allowedHosts = Array.isArray(options.allowedHosts)
+    ? new Set(options.allowedHosts.filter(Boolean).map((host) => String(host).toLowerCase()))
+    : null;
   const validation = validateTarget(targetUrl);
   if (!validation.valid) {
     return Promise.resolve({
@@ -46,6 +49,19 @@ function probeHttp(targetUrl, options = {}) {
       redirectCount: 0,
       tls: null,
       error: validation.reason,
+    });
+  }
+  if (allowedHosts && !allowedHosts.has(validation.url.hostname.toLowerCase())) {
+    return Promise.resolve({
+      targetUrl,
+      method,
+      status: 'UNAUTHORIZED_TARGET',
+      available: false,
+      responseTimeMs: null,
+      statusCode: null,
+      redirectCount: 0,
+      tls: null,
+      error: 'HTTP target host is not approved',
     });
   }
 
@@ -81,13 +97,15 @@ function probeHttp(targetUrl, options = {}) {
         }
         const next = new URL(location, url);
         const nextValidation = validateTarget(next.toString());
-        if (!nextValidation.valid) {
+        if (!nextValidation.valid || (allowedHosts && !allowedHosts.has(nextValidation.url.hostname.toLowerCase()))) {
           finish({
             status: 'INVALID_REDIRECT',
             available: false,
             statusCode: res.statusCode,
             tls: null,
-            error: nextValidation.reason,
+            error: nextValidation.valid
+              ? 'HTTP redirect target is not an approved host'
+              : nextValidation.reason,
           });
           return;
         }

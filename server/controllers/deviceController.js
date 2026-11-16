@@ -353,6 +353,7 @@ const createDevice = async (req, res) => {
       snmpPrivProtocol,
       snmpPrivKey,
       snmpContext,
+      configuredTcpPorts,
       configuredHttpChecks,
       tracerouteEnabled,
       tracerouteMaxHops,
@@ -377,8 +378,22 @@ const createDevice = async (req, res) => {
     if (configuredHttpChecks !== undefined && !Array.isArray(configuredHttpChecks)) {
       return res.status(400).json({ message: 'configuredHttpChecks must be an array' });
     }
+    if (configuredTcpPorts !== undefined && !Array.isArray(configuredTcpPorts)) {
+      return res.status(400).json({ message: 'configuredTcpPorts must be an array' });
+    }
     if (configuredDnsChecks !== undefined && !Array.isArray(configuredDnsChecks)) {
       return res.status(400).json({ message: 'configuredDnsChecks must be an array' });
+    }
+    if (Array.isArray(configuredDnsChecks)) {
+      for (const check of configuredDnsChecks.slice(0, 5)) {
+        if (!isValidIPv4(String(check.server || ''))
+          || typeof check.domain !== 'string'
+          || !/^[a-z0-9.-]+$/i.test(check.domain)
+          || (check.recordType !== undefined
+            && !['A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT', 'PTR'].includes(String(check.recordType).toUpperCase()))) {
+          return res.status(400).json({ message: 'DNS checks require an IPv4 resolver, valid test domain, and supported record type' });
+        }
+      }
     }
     if (tracerouteMaxHops !== undefined && (
       !Number.isInteger(Number(tracerouteMaxHops))
@@ -393,13 +408,6 @@ const createDevice = async (req, res) => {
         const validation = validateTarget(url);
         if (!validation.valid || ![ipAddress, hostname].filter(Boolean).includes(validation.url.hostname)) {
           return res.status(400).json({ message: 'HTTP checks must use an approved device IP address or hostname' });
-        }
-        if (Array.isArray(configuredDnsChecks)) {
-          for (const check of configuredDnsChecks.slice(0, 5)) {
-            if (!isValidIPv4(String(check.server || '')) || typeof check.domain !== 'string' || !/^[a-z0-9.-]+$/i.test(check.domain)) {
-              return res.status(400).json({ message: 'DNS checks require an IPv4 resolver and valid test domain' });
-            }
-          }
         }
       }
     }
@@ -432,6 +440,16 @@ const createDevice = async (req, res) => {
       snmpPrivProtocol: snmpPrivProtocol || 'aes',
       snmpPrivKey: encryptCredential(snmpPrivKey),
       snmpContext,
+      configuredTcpPorts: Array.isArray(configuredTcpPorts)
+        ? configuredTcpPorts
+          .filter((port) => Number.isInteger(Number(port.port)) && Number(port.port) >= 1 && Number(port.port) <= 65535)
+          .slice(0, 10)
+          .map((port) => ({
+            port: Number(port.port),
+            serviceName: port.serviceName || undefined,
+            enabled: port.enabled !== false,
+          }))
+        : [],
       configuredHttpChecks: Array.isArray(configuredHttpChecks)
         ? configuredHttpChecks.slice(0, 5).map((check) => ({
           url: String(check.url || ''),
@@ -448,6 +466,7 @@ const createDevice = async (req, res) => {
         ? configuredDnsChecks.slice(0, 5).map((check) => ({
           server: String(check.server),
           domain: String(check.domain).toLowerCase(),
+          recordType: String(check.recordType || 'A').toUpperCase(),
           enabled: check.enabled !== false,
           timeoutMs: Number.isInteger(Number(check.timeoutMs))
             ? Math.min(10000, Math.max(100, Number(check.timeoutMs)))
@@ -529,6 +548,17 @@ const updateDevice = async (req, res) => {
     }
     if (configuredDnsChecks !== undefined && !Array.isArray(configuredDnsChecks)) {
       return res.status(400).json({ message: 'configuredDnsChecks must be an array' });
+    }
+    if (Array.isArray(configuredDnsChecks)) {
+      for (const check of configuredDnsChecks.slice(0, 5)) {
+        if (!isValidIPv4(String(check.server || ''))
+          || typeof check.domain !== 'string'
+          || !/^[a-z0-9.-]+$/i.test(check.domain)
+          || (check.recordType !== undefined
+            && !['A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT', 'PTR'].includes(String(check.recordType).toUpperCase()))) {
+          return res.status(400).json({ message: 'DNS checks require an IPv4 resolver, valid test domain, and supported record type' });
+        }
+      }
     }
 
     const device = await Device.findById(req.params.id)
@@ -667,13 +697,18 @@ const updateDevice = async (req, res) => {
     }
     if (Array.isArray(configuredDnsChecks)) {
       for (const check of configuredDnsChecks.slice(0, 5)) {
-        if (!isValidIPv4(String(check.server || '')) || typeof check.domain !== 'string' || !/^[a-z0-9.-]+$/i.test(check.domain)) {
-          return res.status(400).json({ message: 'DNS checks require an IPv4 resolver and valid test domain' });
+        if (!isValidIPv4(String(check.server || ''))
+          || typeof check.domain !== 'string'
+          || !/^[a-z0-9.-]+$/i.test(check.domain)
+          || (check.recordType !== undefined
+            && !['A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT', 'PTR'].includes(String(check.recordType).toUpperCase()))) {
+          return res.status(400).json({ message: 'DNS checks require an IPv4 resolver, valid test domain, and supported record type' });
         }
       }
       device.configuredDnsChecks = configuredDnsChecks.slice(0, 5).map((check) => ({
         server: String(check.server),
         domain: String(check.domain).toLowerCase(),
+        recordType: String(check.recordType || 'A').toUpperCase(),
         enabled: check.enabled !== false,
         timeoutMs: Number.isInteger(Number(check.timeoutMs))
           ? Math.min(10000, Math.max(100, Number(check.timeoutMs)))
