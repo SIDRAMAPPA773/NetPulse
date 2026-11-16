@@ -21,6 +21,7 @@ const Settings = () => {
     LATENCY_CRITICAL: 250,
     PACKET_LOSS_WARNING: 5,
     PACKET_LOSS_CRITICAL: 15,
+    TLS_CERTIFICATE_WARNING_DAYS: 30,
     DEVICE_DOWN_FAILURE_THRESHOLD: 3,
     DEVICE_UP_RECOVERY_THRESHOLD: 2
   });
@@ -132,6 +133,7 @@ const Settings = () => {
       LATENCY_CRITICAL: 250,
       PACKET_LOSS_WARNING: 5,
       PACKET_LOSS_CRITICAL: 15,
+      TLS_CERTIFICATE_WARNING_DAYS: 30,
       DEVICE_DOWN_FAILURE_THRESHOLD: 3,
       DEVICE_UP_RECOVERY_THRESHOLD: 2
     });
@@ -441,6 +443,24 @@ const Settings = () => {
               className="w-full bg-white border border-slate-300 rounded-xl px-4 py-2.5 text-slate-900 font-mono focus:outline-none focus:border-blue-500 shadow-2xs"
             />
             <p className="text-[11px] text-slate-400">Threshold for acute carrier loss or link disruption.</p>
+          </div>
+
+          <div className="space-y-2">
+            <label className="block text-slate-700 font-bold flex items-center justify-between">
+              <span>TLS Certificate Warning Window</span>
+              <span className="text-amber-700 font-mono font-bold">{settings.TLS_CERTIFICATE_WARNING_DAYS} days</span>
+            </label>
+            <input
+              type="number"
+              min="0"
+              max="60000"
+              step="1"
+              name="TLS_CERTIFICATE_WARNING_DAYS"
+              value={settings.TLS_CERTIFICATE_WARNING_DAYS}
+              onChange={handleChange}
+              className="w-full bg-white border border-slate-300 rounded-xl px-4 py-2.5 text-slate-900 font-mono focus:outline-none focus:border-blue-500 shadow-2xs"
+            />
+            <p className="text-[11px] text-slate-400">Create a warning when an approved HTTPS certificate expires within this many days.</p>
           </div>
 
           <div className="space-y-2">

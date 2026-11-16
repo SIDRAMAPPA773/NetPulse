@@ -83,6 +83,7 @@ let thresholds = {
   INTERFACE_UTILIZATION_WARNING: 80,
   INTERFACE_UTILIZATION_CRITICAL: 90,
   HEALTH_CRITICAL: 50,
+  TLS_CERTIFICATE_WARNING_DAYS: 30,
   DEVICE_DOWN_FAILURE_THRESHOLD: 3,
   DEVICE_UP_RECOVERY_THRESHOLD: 2,
 };
@@ -679,6 +680,48 @@ async function resolveAlert(device, type) {
   );
 }
 
+function httpAlertType(prefix, targetUrl) {
+  return `${prefix}:${String(targetUrl || 'unknown')}`;
+}
+
+async function processHttpAlerts(device, httpResults = [], tlsWarningDays = thresholds.TLS_CERTIFICATE_WARNING_DAYS) {
+  if (!device || !Array.isArray(httpResults)) return;
+
+  const warningDays = Number.isFinite(Number(tlsWarningDays))
+    ? Math.max(0, Number(tlsWarningDays))
+    : 30;
+
+  for (const result of httpResults) {
+    const targetUrl = result?.targetUrl || 'unknown';
+    const failureType = httpAlertType('HTTP_ENDPOINT_FAILURE', targetUrl);
+    if (result?.available === true) {
+      await resolveAlert(device, failureType);
+    } else {
+      const severity = result?.status === 'TLS_ERROR' ? 'CRITICAL' : 'HIGH';
+      await upsertAlert(
+        device,
+        failureType,
+        severity,
+        `${device.name || device.ipAddress} HTTP check failed for ${targetUrl}: ${result?.error || result?.status || 'unavailable'}`,
+      );
+    }
+
+    const remainingDays = Number(result?.tls?.remainingValidityDays);
+    const certificateType = httpAlertType('TLS_CERTIFICATE_EXPIRING', targetUrl);
+    if (Number.isFinite(remainingDays) && remainingDays <= warningDays) {
+      const severity = remainingDays <= 7 ? 'CRITICAL' : 'HIGH';
+      await upsertAlert(
+        device,
+        certificateType,
+        severity,
+        `${device.name || device.ipAddress} TLS certificate for ${targetUrl} expires in ${remainingDays} day(s)`,
+      );
+    } else {
+      await resolveAlert(device, certificateType);
+    }
+  }
+}
+
 async function saveUnavailable(device, reason, collectionStatus = 'blocked') {
   const stateChanged = device.status !== 'UNKNOWN'
     || device.consecutiveFailureCount !== 0
@@ -900,6 +943,7 @@ async function processDevice(
           timeoutMs: check.timeoutMs,
           allowedHosts: [device.ipAddress, device.hostname],
         })));
+        await processHttpAlerts(device, httpData);
       }
     }
     if (device.tracerouteEnabled && !isEmergencyStopActive()) {
@@ -1477,6 +1521,7 @@ module.exports = {
   startMonitoring,
   stopMonitoring,
   processDevice,
+  processHttpAlerts,
   upsertAlert,
   resolveAlert,
   updateSettingsCache,

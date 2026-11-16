@@ -17,6 +17,7 @@ const seedData = async () => {
       { key: 'LATENCY_CRITICAL', value: 250 },
       { key: 'PACKET_LOSS_WARNING', value: 5 },
       { key: 'PACKET_LOSS_CRITICAL', value: 15 },
+      { key: 'TLS_CERTIFICATE_WARNING_DAYS', value: 30 },
     ];
     for (const setting of defaults) {
       await Setting.updateOne({ key: setting.key }, { $setOnInsert: { value: setting.value } }, { upsert: true });
