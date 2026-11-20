@@ -79,6 +79,10 @@ const testTelemetry = async (req, res) => {
       interfaces: diagnostic.snmp.interfaces || [],
       interfaceDiscoveryErrors: diagnostic.snmp.interfaceDiscoveryErrors || [],
     };
+    if (diagnostic.snmp.sysName) device.snmpSysName = diagnostic.snmp.sysName;
+    if (!device.macAddress && diagnostic.snmp.ifPhysAddress) {
+      device.macAddress = diagnostic.snmp.ifPhysAddress;
+    }
     await device.save();
 
     res.json({

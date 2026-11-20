@@ -24,7 +24,13 @@ const {
 } = require('../utils/networkAuthorizationPolicy');
 const { isFreshInterfaceAuthorization } = require('./interfaceAuthorizationService');
 const { createSnmpSession, HARDWARE_OIDS } = require('../utils/snmpHardwareCollectors');
+const { discoverSnmpInterfaces } = require('../utils/snmpHardwareCollectors');
+const { encryptCredential } = require('../utils/snmpCredentialCrypto');
 const { transitionDeviceHealth } = require('../utils/deviceHealthState');
+const {
+  findIdentityMatch,
+  reconcileDeviceIdentity,
+} = require('../utils/deviceReconciliation');
 const socketService = require('./socketService');
 
 const DISCOVERY_CONCURRENCY = Number.isInteger(Number(process.env.DISCOVERY_MAX_CONCURRENCY))
@@ -91,30 +97,82 @@ function emitAdminEvent(event, payload) {
 }
 
 async function configuredSnmpIdentity(device, rateLimiter, signal) {
-  if (!device || device.monitoringMethod !== 'snmp' || signal.aborted || isEmergencyStopActive()) return null;
+  if (!device || signal.aborted || isEmergencyStopActive()) return null;
   let session;
   try {
     session = createSnmpSession(device, { timeout: 1200, retries: 0 });
     await rateLimiter.acquire();
     if (signal.aborted || isEmergencyStopActive()) return null;
-    return await new Promise((resolve) => {
+    const identity = await new Promise((resolve) => {
       session.get([HARDWARE_OIDS.sysDescr, HARDWARE_OIDS.sysName], (error, varbinds) => {
         if (error || !varbinds) return resolve(null);
         const values = new Map(varbinds
           .filter((varbind) => !snmp.isVarbindError(varbind))
           .map((varbind) => [varbind.oid, String(varbind.value).trim()]));
+        if (values.size === 0) return resolve(null);
         resolve({
-          responded: values.size > 0,
+          responded: true,
           description: values.get(HARDWARE_OIDS.sysDescr) || null,
           name: values.get(HARDWARE_OIDS.sysName) || null,
         });
       });
     });
+    if (!identity) return null;
+    const interfaceDiscovery = await discoverSnmpInterfaces(session, () => rateLimiter.acquire());
+    const interfaceEntry = selectActivePhysicalInterface(interfaceDiscovery.interfaces);
+    return {
+      ...identity,
+      interfaceIndex: interfaceEntry?.interfaceIndex || null,
+      macAddress: interfaceEntry?.physicalAddress || null,
+      interfaces: interfaceDiscovery.interfaces,
+    };
   } catch {
     return null;
   } finally {
     session?.close();
   }
+}
+
+function selectActivePhysicalInterface(interfaces = []) {
+  const excluded = [
+    'loopback', 'tunnel', 'wan miniport', 'virtual', 'teredo',
+    'ppp', 'bluetooth', 'kernel', 'tunnel', 'wi-fi direct',
+  ];
+  const candidates = interfaces.filter((entry) => {
+    const label = `${entry.name || ''} ${entry.description || ''}`.toLowerCase();
+    return entry.operationalStatus === 1
+      && entry.adminStatus !== 2
+      && !excluded.some((term) => label.includes(term));
+  });
+  if (candidates.length === 0) return null;
+  return candidates.sort((left, right) => {
+    const labelScore = (entry) => {
+      const label = `${entry.name || ''} ${entry.description || ''}`.toLowerCase();
+      if (label.includes('wireless') || label.includes('wi-fi') || label.includes('wifi')) return 100;
+      if (label.includes('ethernet')) return 90;
+      return 20;
+    };
+    const rightScore = labelScore(right) + (Number(right.speedBps) > 0 ? 10 : 0);
+    const leftScore = labelScore(left) + (Number(left.speedBps) > 0 ? 10 : 0);
+    return rightScore - leftScore;
+  })[0];
+}
+
+async function probeDefaultSnmpIdentity(ipAddress, rateLimiter, signal) {
+  const community = String(process.env.DEFAULT_SNMP_COMMUNITY || 'public').trim();
+  if (!community) return null;
+  let encryptedCommunity = community;
+  try {
+    encryptedCommunity = encryptCredential(community);
+  } catch {
+    encryptedCommunity = community;
+  }
+  return configuredSnmpIdentity({
+    ipAddress,
+    snmpVersion: '2c',
+    snmpCommunity: encryptedCommunity,
+    monitoringMethod: 'snmp',
+  }, rateLimiter, signal);
 }
 
 async function recordSubnetDiscovery(subnet, job, deviceCount, finishedAt) {
@@ -326,7 +384,10 @@ async function runReservedDiscovery({
             }
           }
           const neighbourEntry = neighbourTable.get(ipAddress) || null;
-          const snmpIdentity = await configuredSnmpIdentity(knownByIp.get(ipAddress), rateLimiter, controller.signal);
+          const knownDevice = knownByIp.get(ipAddress);
+          const snmpIdentity = knownDevice?.monitoringMethod === 'snmp'
+            ? await configuredSnmpIdentity(knownDevice, rateLimiter, controller.signal)
+            : await probeDefaultSnmpIdentity(ipAddress, rateLimiter, controller.signal);
           const reachability = evaluateReachability({
             icmp: probe,
             tcp: tcpRes,
@@ -345,7 +406,7 @@ async function runReservedDiscovery({
             }
             const identity = identifyDevice({
               ipAddress,
-              macAddress: neighbourEntry?.macAddress || null,
+              macAddress: neighbourEntry?.macAddress || snmpIdentity?.macAddress || null,
               hostname: dnsRes?.hostname || snmpIdentity?.name || null,
               openPorts: tcpRes.openPorts,
               isGateway: false,
@@ -353,6 +414,7 @@ async function runReservedDiscovery({
             });
             const confidence = identityConfidence({
               macAddress: identity.macAddress,
+              snmpSysName: snmpIdentity?.name || null,
               hostname: identity.hostname,
               openPorts: tcpRes.openPorts,
               snmpResponded: snmpIdentity?.responded,
@@ -362,6 +424,10 @@ async function runReservedDiscovery({
               name: identity.hostname || `Host (${ipAddress})`,
               ipAddress,
               macAddress: identity.macAddress,
+              snmpSysName: snmpIdentity?.name || null,
+              snmpInterfaceIndex: snmpIdentity?.interfaceIndex || null,
+              snmpDiscovered: Boolean(snmpIdentity?.responded),
+              snmpInterfaces: snmpIdentity?.interfaces || [],
               hostname: identity.hostname,
               vendor: identity.vendor,
               type: identity.deviceType,
@@ -396,41 +462,69 @@ async function runReservedDiscovery({
       $or: [
         { ipAddress: { $in: discoveredIps } },
         { macAddress: { $in: macAddresses } },
+        { subnet: subnet._id },
       ],
     })
-      .select('_id ipAddress monitoringStatus enrollmentStatus status lastSeen reachabilityMethod macAddress vendor hostname subnet enrollmentSource consecutiveFailureCount consecutiveRecoveryCount');
+      .select('+snmpCommunity +snmpAuthKey +snmpPrivKey _id ipAddress monitoringStatus enrollmentStatus status lastSeen lastVerifiedAt reachabilityMethod macAddress snmpSysName vendor hostname subnet enrollmentSource consecutiveFailureCount consecutiveRecoveryCount');
     const existingByIp = new Map(existing.map((device) => [device.ipAddress, device]));
-    const existingByMac = new Map(
-      existing.filter((device) => device.macAddress)
-        .map((device) => [device.macAddress.toLowerCase(), device]),
-    );
+    const approvedHosts = new Set(approval.hosts);
     let enrolledCount = 0;
     let pendingApprovalCount = 0;
     let duplicateCount = 0;
     for (const candidate of discovered) {
-      let device = existingByIp.get(candidate.ipAddress);
-      const duplicateDevice = !device && candidate.macAddress
-        ? existingByMac.get(candidate.macAddress.toLowerCase())
-        : null;
-      if (duplicateDevice) {
-        candidate.isDuplicate = true;
-        candidate.duplicateDeviceId = String(duplicateDevice._id);
-        duplicateCount += 1;
+      let device = findIdentityMatch(candidate, existing, approvedHosts, subnet._id);
+      const isIpReconciliation = device && device.ipAddress !== candidate.ipAddress;
+      if (isIpReconciliation) {
+        const conflictingDevice = existingByIp.get(candidate.ipAddress);
+        if (conflictingDevice && String(conflictingDevice._id) !== String(device._id)) {
+          device = null;
+        } else {
+          existingByIp.delete(candidate.ipAddress);
+          await reconcileDeviceIdentity(device, candidate, { subnetId: subnet._id });
+          existingByIp.set(candidate.ipAddress, device);
+        }
+      }
+      if (!device && candidate.macAddress) {
+        const duplicateDevice = existing.find((entry) => (
+          entry.ipAddress !== candidate.ipAddress
+          && entry.macAddress
+          && entry.macAddress.toLowerCase() === candidate.macAddress.toLowerCase()
+        ));
+        if (duplicateDevice) {
+          candidate.isDuplicate = true;
+          candidate.duplicateDeviceId = String(duplicateDevice._id);
+          duplicateCount += 1;
+        }
+      }
+      if (candidate.isDuplicate) {
+        continue;
       }
       if (!device && subnet.autoEnroll) {
-        if (duplicateDevice) continue;
-        const enrollmentStatus = subnet.requireEnrollmentApproval ? 'pending' : 'approved';
+        const enrollmentStatus = candidate.snmpDiscovered
+          ? 'approved'
+          : (subnet.requireEnrollmentApproval ? 'pending' : 'approved');
+        let defaultCommunity = String(process.env.DEFAULT_SNMP_COMMUNITY || 'public').trim();
+        try {
+          defaultCommunity = encryptCredential(defaultCommunity);
+        } catch {
+          // Legacy plaintext credentials remain accepted during staged key migration.
+        }
         device = await Device.create({
           name: candidate.name,
           ipAddress: candidate.ipAddress,
           macAddress: candidate.macAddress || undefined,
+          snmpSysName: candidate.snmpSysName || undefined,
           hostname: candidate.hostname || undefined,
           vendor: candidate.vendor || 'Unknown',
           type: candidate.type || 'other',
           operatingSystem: candidate.operatingSystem || 'Unknown',
           location: candidate.location,
           description: candidate.description,
-          monitoringMethod: 'icmp',
+          monitoringMethod: candidate.snmpDiscovered ? 'snmp' : 'icmp',
+          snmpCommunity: candidate.snmpDiscovered ? defaultCommunity : undefined,
+          snmpVersion: '2c',
+          snmpInterfaceIndex: candidate.snmpInterfaceIndex || undefined,
+          snmpSysName: candidate.snmpSysName || undefined,
           reachabilityMethod: candidate.reachabilityMethod,
           status: candidate.status,
           enrollmentStatus,
@@ -439,13 +533,39 @@ async function runReservedDiscovery({
           discoverySource: candidate.discoverySource,
           firstDiscoveredAt: new Date(),
           lastDiscoveredAt: new Date(),
-          monitoringStatus: enrollmentStatus === 'approved' && subnet.monitoringEnabled === true,
+          monitoringStatus: candidate.snmpDiscovered
+            ? true
+            : (enrollmentStatus === 'approved' && subnet.monitoringEnabled === true),
         });
         existingByIp.set(candidate.ipAddress, device);
+        existing.push(device);
         enrolledCount += 1;
         if (enrollmentStatus === 'pending') pendingApprovalCount += 1;
       } else if (device) {
         const seenAt = new Date();
+        if (candidate.snmpDiscovered) {
+          if (device.monitoringMethod !== 'snmp') {
+            let defaultCommunity = String(process.env.DEFAULT_SNMP_COMMUNITY || 'public').trim();
+            try {
+              defaultCommunity = encryptCredential(defaultCommunity);
+              device.snmpCommunity = defaultCommunity;
+            } catch {
+              if (!device.snmpCommunity) device.snmpCommunity = defaultCommunity;
+            }
+          }
+          device.monitoringMethod = 'snmp';
+          device.enrollmentStatus = 'approved';
+          device.monitoringStatus = true;
+          if (candidate.snmpInterfaceIndex) device.snmpInterfaceIndex = candidate.snmpInterfaceIndex;
+          if (candidate.snmpSysName) device.snmpSysName = candidate.snmpSysName;
+          device.telemetryDiagnostics = {
+            status: 'AVAILABLE',
+            reason: 'Auto-discovered over SNMP',
+            snmpVersion: device.snmpVersion || '2c',
+            collectedAt: seenAt,
+            interfaces: candidate.snmpInterfaces || [],
+          };
+        }
         device.status = transitionDeviceHealth(device, {
           reachable: true,
           degraded: candidate.status === 'WARNING',
@@ -457,9 +577,10 @@ async function runReservedDiscovery({
         if (!device.subnet) device.subnet = subnet._id;
         if (!device.discoverySource) device.discoverySource = candidate.discoverySource;
         if (!device.macAddress && candidate.macAddress) device.macAddress = candidate.macAddress;
+        if (candidate.snmpSysName) device.snmpSysName = candidate.snmpSysName;
         if (!device.vendor || device.vendor === 'Unknown') device.vendor = candidate.vendor;
         if (!device.hostname && candidate.hostname) device.hostname = candidate.hostname;
-        await device.save();
+        if (!isIpReconciliation) await device.save();
         emitAdminEvent('deviceUpdated', device.toJSON());
       }
       if (device) candidate.deviceId = String(device._id);
@@ -601,4 +722,5 @@ module.exports = {
   recoverInterruptedDiscoveryJobs,
   cancelDiscoveryJob,
   cancelDiscoveryForSubnet,
+  selectActivePhysicalInterface,
 };

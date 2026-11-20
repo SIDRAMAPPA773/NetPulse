@@ -123,6 +123,16 @@ function exactCounterValue(value) {
   return Number.isSafeInteger(value) && value >= 0 ? String(value) : null;
 }
 
+function physicalAddressValue(value) {
+  if (Buffer.isBuffer(value)) {
+    const hex = value.toString('hex');
+    return hex.length > 0 ? hex.match(/.{1,2}/g).join(':').toUpperCase() : null;
+  }
+  if (typeof value !== 'string') return null;
+  const compact = value.replace(/[^0-9a-f]/gi, '');
+  return compact.length === 12 ? compact.match(/.{1,2}/g).join(':').toUpperCase() : null;
+}
+
 function classifySnmpError(error) {
   if (error?.code === 'SNMP_CREDENTIAL_ENCRYPTION_KEY_MISSING'
     || error?.code === 'SNMP_CREDENTIAL_ENCRYPTION_KEY_INVALID'
@@ -203,15 +213,6 @@ async function collectSnmp(device, options = {}) {
     );
   }
   if (Number.isInteger(ifIndex) && ifIndex > 0) {
-    if (device.snmpVersion !== '1') {
-      oids.push(
-        `1.3.6.1.2.1.31.1.1.1.6.${ifIndex}`,
-        `1.3.6.1.2.1.31.1.1.1.10.${ifIndex}`,
-        `1.3.6.1.2.1.31.1.1.1.7.${ifIndex}`,
-        `1.3.6.1.2.1.31.1.1.1.11.${ifIndex}`,
-        `1.3.6.1.2.1.31.1.1.1.15.${ifIndex}`,
-      );
-    }
     oids.push(
       `1.3.6.1.2.1.2.2.1.10.${ifIndex}`,
       `1.3.6.1.2.1.2.2.1.16.${ifIndex}`,
@@ -223,6 +224,7 @@ async function collectSnmp(device, options = {}) {
       `1.3.6.1.2.1.2.2.1.13.${ifIndex}`,
       `1.3.6.1.2.1.2.2.1.19.${ifIndex}`,
       `1.3.6.1.2.1.2.2.1.5.${ifIndex}`,
+      `1.3.6.1.2.1.2.2.1.6.${ifIndex}`,
       `1.3.6.1.2.1.2.2.1.8.${ifIndex}`,
     );
   }
@@ -341,12 +343,15 @@ async function collectSnmp(device, options = {}) {
             HARDWARE_OIDS.sysDescr,
             HARDWARE_OIDS.sysName,
           ].includes(varbind.oid);
+          const isPhysicalAddress = varbind.oid === `1.3.6.1.2.1.2.2.1.6.${ifIndex}`;
           if (isSystemText) {
             values[varbind.oid] = Buffer.isBuffer(varbind.value)
               ? varbind.value.toString()
               : typeof varbind.value === 'string'
                 ? varbind.value
                 : null;
+          } else if (isPhysicalAddress) {
+            values[varbind.oid] = physicalAddressValue(varbind.value);
           } else {
             values[varbind.oid] = varbind.oid.startsWith('1.3.6.1.2.1.31.1.1.1.')
               ? exactCounterValue(varbind.value)
@@ -370,6 +375,7 @@ async function collectSnmp(device, options = {}) {
         responded: true,
         sysDescr: values[HARDWARE_OIDS.sysDescr] ?? null,
         sysName: values[HARDWARE_OIDS.sysName] ?? null,
+        ifPhysAddress: values[`1.3.6.1.2.1.2.2.1.6.${ifIndex}`] ?? null,
         sysUpTime: values['1.3.6.1.2.1.1.3.0'] ?? null,
         identityVerified: [HARDWARE_OIDS.sysDescr, HARDWARE_OIDS.sysName].some((oid) => (
           typeof values[oid] === 'string' && values[oid].trim().length > 0
@@ -393,7 +399,7 @@ async function collectSnmp(device, options = {}) {
         interfaceHighSpeedMbps: readHighCapacity(15),
         operationalStatus: read(8),
         countersSupported: Number.isInteger(ifIndex) && ifIndex > 0
-          && inOctets !== null && outOctets !== null && !unsupported,
+          && inOctets !== null && outOctets !== null,
         highCapacitySupported: !highCapacityUnsupported
           && (inOctetsHC !== null || outOctetsHC !== null),
         oidChecks,
@@ -1079,6 +1085,8 @@ async function processDevice(
   device.healthScore = healthResult.overallScore;
   device.healthStatus = healthResult.healthStatus;
   device.reachabilityMethod = reachabilityEval?.confirmedMethod || (reachable ? (snmpData?.responded ? 'snmp' : 'icmp') : 'none');
+  if (snmpData?.sysName) device.snmpSysName = snmpData.sysName;
+  if (!device.macAddress && snmpData?.ifPhysAddress) device.macAddress = snmpData.ifPhysAddress;
   device.latencyStats = latencyMetrics;
   if (dnsData) device.dnsIntelligence = dnsData;
   if (reachable) {

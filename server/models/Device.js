@@ -4,6 +4,7 @@ const deviceSchema = new mongoose.Schema({
   name: { type: String, required: true },
   ipAddress: { type: String, required: true, unique: true },
   macAddress: { type: String },
+  snmpSysName: { type: String },
   hostname: { type: String },
   vendor: { type: String },
   type: {
@@ -125,6 +126,12 @@ const deviceSchema = new mongoose.Schema({
   lastRecoveryAt: { type: Date, default: null },
   totalDowntimeMs: { type: Number, min: 0, default: 0 },
   lastSeen: { type: Date },
+  ipAddressChanges: [{
+    previousIpAddress: { type: String, required: true },
+    newIpAddress: { type: String, required: true },
+    reason: { type: String, required: true },
+    observedAt: { type: Date, default: Date.now },
+  }],
 }, {
   timestamps: true,
   toJSON: {
@@ -139,5 +146,7 @@ const deviceSchema = new mongoose.Schema({
 
 deviceSchema.index({ subnet: 1, enrollmentStatus: 1, monitoringStatus: 1 });
 deviceSchema.index({ monitoringStatus: 1, collectorId: 1 });
+deviceSchema.index({ macAddress: 1 });
+deviceSchema.index({ snmpSysName: 1 });
 
 module.exports = mongoose.model('Device', deviceSchema);

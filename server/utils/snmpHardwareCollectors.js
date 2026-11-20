@@ -151,7 +151,9 @@ async function discoverSnmpInterfaces(session, beforeRequest) {
       if (!property) continue;
       const entry = interfaces.get(Number(index)) || { interfaceIndex: Number(index) };
       entry[property] = Buffer.isBuffer(varbind.value)
-        ? varbind.value.toString()
+        ? (property === 'physicalAddress'
+          ? varbind.value.toString('hex')
+          : varbind.value.toString())
         : varbind.value;
       interfaces.set(Number(index), entry);
     }
@@ -159,6 +161,7 @@ async function discoverSnmpInterfaces(session, beforeRequest) {
   readTable(interfaceTable, '1.3.6.1.2.1.2.2.1', {
     2: 'description',
     5: 'speedBps',
+    6: 'physicalAddress',
     7: 'adminStatus',
     8: 'operationalStatus',
   });
@@ -170,6 +173,12 @@ async function discoverSnmpInterfaces(session, beforeRequest) {
   const discovered = [...interfaces.values()]
     .map((entry) => ({
       ...entry,
+      ...(typeof entry.physicalAddress === 'string'
+        && /^[0-9a-f]{12}$/i.test(entry.physicalAddress.replace(/[^0-9a-f]/gi, ''))
+        ? {
+          physicalAddress: entry.physicalAddress.replace(/[^0-9a-f]/gi, '').toUpperCase().match(/.{1,2}/g).join(':'),
+        }
+        : {}),
       name: entry.name || entry.description || `ifIndex ${entry.interfaceIndex}`,
       speedBps: Number(entry.highSpeedMbps) > 0
         ? Number(entry.highSpeedMbps) * 1_000_000
